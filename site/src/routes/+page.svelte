@@ -4,7 +4,7 @@
 
   const width = 1200;
   const height = 1600;
-  let source: ImageBitmap | null = null;
+  let source: ImageBitmap | HTMLImageElement | null = null;
   let previewCanvas: HTMLCanvasElement;
   let resultCanvas: HTMLCanvasElement;
   let device = '';
@@ -25,6 +25,44 @@
     if (device && token) status = 'Connected link received. Choose a photo.';
   });
 
+  function describeError(error: unknown): string {
+    if (error instanceof Error) return error.message || error.name;
+    if (typeof error === 'string') return error;
+    try {
+      const json = JSON.stringify(error);
+      if (json && json !== '{}') return json;
+    } catch {
+      // Fall through for non-serializable browser/library errors.
+    }
+    return String(error);
+  }
+
+  async function decodeBlob(blob: Blob): Promise<ImageBitmap | HTMLImageElement> {
+    try {
+      return await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    } catch (bitmapError) {
+      const url = URL.createObjectURL(blob);
+      try {
+        const image = new Image();
+        image.decoding = 'async';
+        image.src = url;
+        await image.decode();
+        return image;
+      } catch (imageError) {
+        throw new Error(
+          `browser decoder: ${describeError(bitmapError)}; image fallback: ${describeError(imageError)}`
+        );
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+  }
+
+  function releaseSource() {
+    if (source instanceof ImageBitmap) source.close();
+    source = null;
+  }
+
   async function choose(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const selected = input.files?.[0];
@@ -32,13 +70,27 @@
     busy = true;
     status = 'Decoding photo…';
     try {
-      let blob: Blob = selected;
-      if (/hei[cf]/i.test(selected.type) || /\.hei[cf]$/i.test(selected.name)) {
-        const decoded = await heic2any({ blob: selected, toType: 'image/jpeg', quality: 0.95 });
-        blob = Array.isArray(decoded) ? decoded[0] : decoded;
+      const isHeic = /hei[cf]/i.test(selected.type) || /\.hei[cf]$/i.test(selected.name);
+      let decodedSource: ImageBitmap | HTMLImageElement;
+      try {
+        // Safari can decode HEIC natively even when createImageBitmap cannot.
+        decodedSource = await decodeBlob(selected);
+      } catch (nativeError) {
+        if (!isHeic) throw nativeError;
+        try {
+          const converted = await heic2any({ blob: selected, toType: 'image/jpeg', quality: 0.95 });
+          const jpeg = Array.isArray(converted) ? converted[0] : converted;
+          if (!(jpeg instanceof Blob)) throw new Error('converter returned no image');
+          decodedSource = await decodeBlob(jpeg);
+        } catch (conversionError) {
+          throw new Error(
+            `native HEIC support failed (${describeError(nativeError)}); ` +
+            `HEIC conversion failed (${describeError(conversionError)})`
+          );
+        }
       }
-      source?.close();
-      source = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+      releaseSource();
+      source = decodedSource;
       const normalError = Math.abs(Math.log((source.width / source.height) / (width / height)));
       const rotatedError = Math.abs(Math.log((source.height / source.width) / (width / height)));
       rotation = rotatedError < normalError ? 90 : 0;
@@ -49,7 +101,7 @@
       draw(previewCanvas, 450, 600);
       status = rotation ? 'Photo loaded and auto-rotated.' : 'Photo loaded.';
     } catch (error) {
-      status = `Could not decode this photo: ${String(error)}`;
+      status = `Could not decode this photo: ${describeError(error)}`;
     } finally {
       busy = false;
     }
