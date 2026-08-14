@@ -1,0 +1,8 @@
+FROM docker.io/library/python:3.12-slim-bookworm
+
+ARG PLATFORMIO_VERSION=6.1.18
+RUN pip install --no-cache-dir "platformio==${PLATFORMIO_VERSION}"
+
+WORKDIR /workspace
+ENTRYPOINT ["pio"]
+CMD ["run", "-d", "firmware/bringup"]
