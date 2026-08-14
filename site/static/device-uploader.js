@@ -21,6 +21,65 @@
   const button = root.querySelector('button');
   let image;
 
+  function ditherWorker() {
+    self.onmessage = event => {
+      const { buffer, width, height } = event.data;
+      const source = new Uint8ClampedArray(buffer);
+      const palette = [[0,0,0],[255,255,255],[0,145,70],[0,75,190],[210,30,40],[245,205,30]];
+      const packed = new Uint8Array(width * height / 2);
+      let current = new Float32Array((width + 2) * 3);
+      let next = new Float32Array((width + 2) * 3);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const pixel = (y * width + x) * 4, error = (x + 1) * 3;
+          const red = Math.max(0, Math.min(255, source[pixel] + current[error]));
+          const green = Math.max(0, Math.min(255, source[pixel + 1] + current[error + 1]));
+          const blue = Math.max(0, Math.min(255, source[pixel + 2] + current[error + 2]));
+          let selected = 0, best = Infinity;
+          for (let index = 0; index < palette.length; index++) {
+            const color = palette[index];
+            const dr=red-color[0], dg=green-color[1], db=blue-color[2];
+            const distance=dr*dr*.3+dg*dg*.59+db*db*.11;
+            if (distance < best) { best=distance; selected=index; }
+          }
+          const packedIndex = (y * width + x) >> 1;
+          if (x & 1) packed[packedIndex] |= selected; else packed[packedIndex] = selected << 4;
+          const errors = [red-palette[selected][0], green-palette[selected][1], blue-palette[selected][2]];
+          for (let channel=0; channel<3; channel++) {
+            const value=errors[channel];
+            current[error+3+channel]+=value*7/16; next[error-3+channel]+=value*3/16;
+            next[error+channel]+=value*5/16; next[error+3+channel]+=value/16;
+          }
+        }
+        current=next; next=new Float32Array((width+2)*3);
+        if (y % 80 === 79) self.postMessage({ progress: Math.round((y + 1) * 100 / height) });
+      }
+      self.postMessage({ packed: packed.buffer }, [packed.buffer]);
+    };
+  }
+
+  function dither(buffer, width, height) {
+    return new Promise((resolve, reject) => {
+      const source = `(${ditherWorker.toString()})()`;
+      const workerUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+      const worker = new Worker(workerUrl);
+      worker.onmessage = event => {
+        if (event.data.packed) {
+          worker.terminate(); URL.revokeObjectURL(workerUrl);
+          resolve(new Uint8Array(event.data.packed));
+        } else if (event.data.progress) {
+          progress.value = event.data.progress;
+          status.textContent = `Making six e-paper colors… ${event.data.progress}%`;
+        }
+      };
+      worker.onerror = event => {
+        worker.terminate(); URL.revokeObjectURL(workerUrl);
+        reject(new Error(event.message || 'color worker failed'));
+      };
+      worker.postMessage({ buffer, width, height }, [buffer]);
+    });
+  }
+
   async function heartbeat() {
     if (!token) return;
     try {
@@ -81,29 +140,17 @@
     const width = 1200, height = 1600;
     const canvas = document.createElement('canvas');
     draw(canvas, width, height);
-    const source = canvas.getContext('2d', { alpha: false }).getImageData(0, 0, width, height).data;
-    const palette = [[0,0,0],[255,255,255],[0,145,70],[0,75,190],[210,30,40],[245,205,30]];
-    const packed = new Uint8Array(width * height / 2);
-    let current = new Float32Array((width + 2) * 3), next = new Float32Array((width + 2) * 3);
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const pixel = (y * width + x) * 4, error = (x + 1) * 3;
-        const rgb = [0,1,2].map(channel => Math.max(0, Math.min(255, source[pixel + channel] + current[error + channel])));
-        let selected = 0, best = Infinity;
-        palette.forEach((color, index) => {
-          const dr=rgb[0]-color[0], dg=rgb[1]-color[1], db=rgb[2]-color[2];
-          const distance=dr*dr*.3+dg*dg*.59+db*db*.11;
-          if (distance < best) { best=distance; selected=index; }
-        });
-        const packedIndex = (y * width + x) >> 1;
-        if (x & 1) packed[packedIndex] |= selected; else packed[packedIndex] = selected << 4;
-        for (let channel=0; channel<3; channel++) {
-          const value=rgb[channel]-palette[selected][channel];
-          current[error+3+channel]+=value*7/16; next[error-3+channel]+=value*3/16;
-          next[error+channel]+=value*5/16; next[error+3+channel]+=value/16;
-        }
-      }
-      current=next; next=new Float32Array((width+2)*3);
+    const pixels = canvas.getContext('2d', { alpha: false }).getImageData(0, 0, width, height).data;
+    progress.hidden = false;
+    progress.value = 0;
+    let packed;
+    try {
+      packed = await dither(pixels.buffer, width, height);
+    } catch (error) {
+      status.textContent = `Color processing failed: ${error.message || error}`;
+      progress.hidden = true;
+      button.disabled = false;
+      return;
     }
     status.textContent = 'Uploading to the display… 0%';
     progress.hidden = false;
@@ -112,6 +159,7 @@
       await new Promise((resolve, reject) => {
         const request = new XMLHttpRequest();
         request.open('POST', '/api/image');
+        request.timeout = 120000;
         request.setRequestHeader('Content-Type', 'application/octet-stream');
         request.setRequestHeader('X-Upload-Token', token);
         request.upload.onprogress = event => {
@@ -121,6 +169,7 @@
           status.textContent = `Uploading to the display… ${percent}%`;
         };
         request.onerror = () => reject(new Error('network connection failed'));
+        request.ontimeout = () => reject(new Error('display did not accept the upload within two minutes'));
         request.onabort = () => reject(new Error('upload was cancelled'));
         request.onload = () => {
           let result = {};

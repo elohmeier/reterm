@@ -310,7 +310,7 @@ void handleCancel() {
   server.send(200, "application/json", "{\"status\":\"cancelled\"}");
 }
 
-bool connectSavedWifi() {
+bool beginSavedWifi() {
   Preferences preferences;
   if (!preferences.begin("wificaptive", true)) return false;
   int index = preferences.getInt("wifi_last_index", 0);
@@ -324,11 +324,35 @@ bool connectSavedWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("reterm-e1004");
   WiFi.begin(ssid.c_str(), password.c_str());
-  const uint32_t deadline = millis() + 20000;
+  return true;
+}
+
+bool waitForWifi(uint32_t timeoutMs) {
+  const uint32_t deadline = millis() + timeoutMs;
   while (WiFi.status() != WL_CONNECTED && int32_t(deadline - millis()) > 0) {
     delay(100);
   }
   return WiFi.status() == WL_CONNECTED;
+}
+
+bool connectSavedWifi() {
+  return beginSavedWifi() && waitForWifi(20000);
+}
+
+void drawQrPage(QRCode &qr, int16_t left, int16_t top, int16_t scale,
+                uint16_t page) {
+  const int16_t pageTop = page * display.pageHeight();
+  const int16_t pageBottom = pageTop + display.pageHeight();
+  for (uint8_t y = 0; y < qr.size; ++y) {
+    const int16_t moduleTop = top + y * scale;
+    if (moduleTop + scale <= pageTop || moduleTop >= pageBottom) continue;
+    for (uint8_t x = 0; x < qr.size; ++x) {
+      if (qrcode_getModule(&qr, x, y)) {
+        display.fillRect(left + x * scale, moduleTop, scale, scale,
+                         GxEPD_BLACK);
+      }
+    }
+  }
 }
 
 void drawProvisionQr(const String &ssid, const String &password) {
@@ -344,6 +368,7 @@ void drawProvisionQr(const String &ssid, const String &password) {
 
   display.setFullWindow();
   display.firstPage();
+  uint16_t page = 0;
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLUE);
@@ -354,14 +379,7 @@ void drawProvisionQr(const String &ssid, const String &password) {
     display.setTextSize(2);
     display.setCursor(215, 210);
     display.print("Scan to join the temporary network");
-    for (uint8_t y = 0; y < qr.size; ++y) {
-      for (uint8_t x = 0; x < qr.size; ++x) {
-        if (qrcode_getModule(&qr, x, y)) {
-          display.fillRect(left + x * scale, top + y * scale, scale, scale,
-                           GxEPD_BLACK);
-        }
-      }
-    }
+    drawQrPage(qr, left, top, scale, page++);
     display.setTextColor(GxEPD_GREEN);
     display.setTextSize(2);
     display.setCursor(170, 1120);
@@ -458,6 +476,7 @@ void drawUploadQr(const String &url) {
 
   display.setFullWindow();
   display.firstPage();
+  uint16_t page = 0;
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLUE);
@@ -468,16 +487,7 @@ void drawUploadQr(const String &url) {
     display.setTextSize(2);
     display.setCursor(265, 220);
     display.print("Scan within five minutes");
-    display.fillRect(left - 28, top - 28, qrPixels + 56, qrPixels + 56,
-                     GxEPD_WHITE);
-    for (uint8_t y = 0; y < qr.size; ++y) {
-      for (uint8_t x = 0; x < qr.size; ++x) {
-        if (qrcode_getModule(&qr, x, y)) {
-          display.fillRect(left + x * scale, top + y * scale, scale, scale,
-                           GxEPD_BLACK);
-        }
-      }
-    }
+    drawQrPage(qr, left, top, scale, page++);
     display.setTextColor(GxEPD_GREEN);
     display.setTextSize(2);
     display.setCursor(190, 1220);
@@ -490,15 +500,19 @@ void drawUploadQr(const String &url) {
 
 void runUploadSession() {
   Serial.println("Starting Wi-Fi upload session");
-  if (!connectSavedWifi() && !provisionWifi()) {
+  sessionToken = uartSessionToken.isEmpty() ? makeToken() : uartSessionToken;
+  uartSessionToken = "";
+  // Serving the uploader from the E1004 makes Safari's upload same-origin.
+  // Use the assigned numeric address: multicast DNS is unreliable on guest or
+  // client-isolated WLANs, while the QR is regenerated for every session.
+  const bool wifiStarted = beginSavedWifi();
+  const uint32_t wifiStartedAt = millis();
+  if ((!wifiStarted || !waitForWifi(20000)) && !provisionWifi()) {
     Serial.println("Wi-Fi connection/provisioning failed");
     return;
   }
-
-  sessionToken = uartSessionToken.isEmpty() ? makeToken() : uartSessionToken;
-  uartSessionToken = "";
-  // Serving the uploader from the E1004 makes Safari's upload same-origin;
-  // iOS otherwise blocks an HTTPS GitHub Pages fetch to this local HTTP API.
+  Serial.print("Wi-Fi ready ms = ");
+  Serial.println(millis() - wifiStartedAt);
   const String qrUrl = "http://" + WiFi.localIP().toString() +
                        "/?token=" + sessionToken;
   drawUploadQr(qrUrl);
@@ -564,7 +578,10 @@ void setup() {
   const bool buttonWake =
       esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 ||
       digitalRead(kButton) == LOW;
-  const StartupCommand command = receiveStartupCommand();
+  // A physical wake is unambiguous and should react immediately. Retain the
+  // three-second UART recovery window only for reset/power-on host workflows.
+  const StartupCommand command =
+      buttonWake ? StartupCommand::None : receiveStartupCommand();
   if (command == StartupCommand::Image) goToSleep();
   if (command == StartupCommand::Web || buttonWake) {
     runUploadSession();

@@ -30,6 +30,20 @@ keeps the session active while the user chooses and edits a photo. An absolute
 forever. First-run provisioning remains available for three minutes. Tapping
 a capacitive button during either window cancels it.
 
+The device-hosted editor also performs dithering in a Web Worker. This keeps
+its 15-second heartbeat and UI progress active while an iPhone processes all
+1.92 million pixels, preventing CPU-bound image work from accidentally
+expiring the device session before the HTTP upload starts.
+
+On a button wake, firmware starts Wi-Fi and uses its assigned numeric address
+in the QR. This avoids relying on multicast DNS, which is often unreliable on
+guest or client-isolated WLANs. Button wakes bypass the UART recovery grace
+period; that three-second window remains available after reset for host image
+tools.
+The QR renderer only visits modules intersecting the current 40-line display
+page; avoiding repeatedly clipped QR geometry reduced measured time from an
+upload command to physical panel refresh from about 24 seconds to 3.3 seconds.
+
 ## HTTP API
 
 The API listens on port 80 of the address encoded in the QR.
