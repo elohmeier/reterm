@@ -8,7 +8,7 @@
     <label>Zoom<input class="zoom" type="range" min="1" max="3" step=".01" value="1"></label>
     <label>Move left/right<input class="x" type="range" min="-1" max="1" step=".01" value="0"></label>
     <label>Move up/down<input class="y" type="range" min="-1" max="1" step=".01" value="0"></label>
-    <canvas width="300" height="400"></canvas><button disabled>Make colors & send</button></div>`;
+    <canvas width="300" height="400"></canvas><progress max="100" value="0" hidden></progress><button disabled>Make colors & send</button></div>`;
   const status = root.querySelector('.status');
   const file = root.querySelector('.file');
   const fit = root.querySelector('.fit');
@@ -17,6 +17,7 @@
   const offsetX = root.querySelector('.x');
   const offsetY = root.querySelector('.y');
   const preview = root.querySelector('canvas');
+  const progress = root.querySelector('progress');
   const button = root.querySelector('button');
   let image;
 
@@ -94,16 +95,38 @@
       }
       current=next; next=new Float32Array((width+2)*3);
     }
-    status.textContent = 'Uploading to the display…';
+    status.textContent = 'Uploading to the display… 0%';
+    progress.hidden = false;
+    progress.value = 0;
     try {
-      const response = await fetch('/api/image', { method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream', 'X-Upload-Token': token }, body: packed });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      await new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('POST', '/api/image');
+        request.setRequestHeader('Content-Type', 'application/octet-stream');
+        request.setRequestHeader('X-Upload-Token', token);
+        request.upload.onprogress = event => {
+          if (!event.lengthComputable) return;
+          const percent = Math.min(100, Math.round(event.loaded * 100 / event.total));
+          progress.value = percent;
+          status.textContent = `Uploading to the display… ${percent}%`;
+        };
+        request.onerror = () => reject(new Error('network connection failed'));
+        request.onabort = () => reject(new Error('upload was cancelled'));
+        request.onload = () => {
+          let result = {};
+          try { result = JSON.parse(request.responseText); } catch { /* handled below */ }
+          if (request.status >= 200 && request.status < 300) resolve(result);
+          else reject(new Error(result.error || `HTTP ${request.status}`));
+        };
+        request.send(packed);
+      });
+      progress.value = 100;
       status.textContent = 'Received! The display will refresh in about 30 seconds.';
     } catch (error) {
       status.textContent = `Upload failed: ${error.message || error}`;
       button.disabled = false;
+    } finally {
+      setTimeout(() => { progress.hidden = true; }, 1500);
     }
   });
 })();

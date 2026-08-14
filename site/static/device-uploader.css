@@ -13,3 +13,4 @@ select, input[type=range] { width: 100%; font: inherit; }
 button { color: white; background: #d22538; }
 button:disabled { opacity: .45; }
 canvas { display: block; width: min(100%, 360px); aspect-ratio: 3/4; margin: auto; border: 2px solid; background: #eee; }
+progress { width: 100%; height: 1.2rem; accent-color: #159653; }
