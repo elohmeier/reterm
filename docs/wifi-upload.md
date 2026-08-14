@@ -23,9 +23,12 @@
    upload, refreshes the panel, invalidates the token, disables Wi-Fi, and
    returns to deep sleep.
 
-The upload API remains available for 60 seconds after the Pages QR has
-finished refreshing. First-run provisioning remains available for three
-minutes. Tapping a capacitive button during either window cancels it.
+The upload API has a five-minute inactivity timeout after the upload QR has
+finished refreshing. An authenticated heartbeat from the open local uploader
+keeps the session active while the user chooses and edits a photo. An absolute
+30-minute cap prevents an abandoned browser tab from holding Wi-Fi awake
+forever. First-run provisioning remains available for three minutes. Tapping
+a capacitive button during either window cancels it.
 
 ## HTTP API
 

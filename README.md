@@ -49,7 +49,7 @@ A dithered PNG preview is written to
 
 ## Wireless photo upload
 
-Press the E1004 button while it sleeps to open a temporary wireless upload
+Press the E1004 button while it sleeps to open a five-minute wireless upload
 session. On first use, scan the displayed Wi-Fi QR and use the captive portal
 to save a home network. The device then displays a one-time QR for the GitHub
 Pages uploader. The browser performs all resizing and six-pigment dithering,

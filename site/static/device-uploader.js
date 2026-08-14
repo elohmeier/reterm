@@ -21,6 +21,16 @@
   const button = root.querySelector('button');
   let image;
 
+  async function heartbeat() {
+    if (!token) return;
+    try {
+      const response = await fetch('/api/status', { headers: { 'X-Upload-Token': token }, cache: 'no-store' });
+      if (response.status === 401) status.textContent = 'This upload session has expired. Start a new one from the display.';
+    } catch { /* A later heartbeat or upload will report a persistent failure. */ }
+  }
+  heartbeat();
+  setInterval(heartbeat, 15000);
+
   function draw(canvas, width, height) {
     canvas.width = width;
     canvas.height = height;
