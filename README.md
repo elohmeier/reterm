@@ -1,10 +1,12 @@
-# reTerminal E1001 firmware workbench
+# reTerminal E1001 and E1004 firmware workbench
 
 This repository is a reproducible starting point for custom firmware on the
-Seeed Studio reTerminal E1001. It contains:
+Seeed Studio reTerminal E1001 and E1004. It contains:
 
 - `firmware/bringup`: a small custom, offline display bring-up image;
+- `firmware/e1004`: a custom color display image for the 13.3-inch E1004;
 - `upstream/seeed-trmnl-1.8.10`: the official open-source firmware snapshot;
+- `upstream/seeed-trmnl-e1004-1.8.10`: the E1004 firmware snapshot;
 - `upstream/binaries/trmnl-1.8.10`: matching official release binaries; and
 - `docs/upstream-analysis.md`: hardware, firmware, recovery, and flashing notes.
 
@@ -15,9 +17,11 @@ bridge (`1a86:7523`). Do not erase it before making a full flash backup.
 
 ```sh
 sh tools/build-container.sh
+sh tools/build-container.sh firmware/e1004
 ```
 
 The result is `firmware/bringup/.pio/build/reterminal-e1001/firmware.bin`.
+The E1004 result is `firmware/e1004/.pio/build/reterminal-e1004/firmware.bin`.
 See the analysis notes before attempting to flash it.
 
 The initial bring-up image has been built, flashed at factory app0 offset
