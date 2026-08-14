@@ -76,7 +76,9 @@ def run(command: list[str]) -> None:
 
 
 def wait_for_ready(port: str) -> serial.Serial:
-    deadline = time.monotonic() + 20
+    # First boot of persistence-enabled firmware may format the factory's
+    # previously unused 6 MiB SPIFFS partition before announcing READY.
+    deadline = time.monotonic() + 120
     device = serial.Serial(port, BAUD, timeout=0.25, write_timeout=10)
     # CH341 DTR/RTS wiring: pulse reset so --no-flash starts a fresh receiver.
     device.dtr = False

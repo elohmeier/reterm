@@ -19,13 +19,16 @@
    dithering to black, white, green, blue, red, and yellow, and packs two
    pixels into each byte.
 7. The browser sends the 960,000-byte framebuffer to the E1004. The firmware
-   copies each completed 600-byte row directly into PSRAM, acknowledges the
-   upload, refreshes the panel, invalidates the token, disables Wi-Fi, and
-   returns to deep sleep.
+   copies each completed 600-byte row directly into PSRAM while persisting the
+   packed framebuffer in SPIFFS, acknowledges the upload, refreshes the panel,
+   invalidates the token, disables Wi-Fi, and returns to deep sleep.
 
 The HTTP session remains alive until the successful image request's `202`
 response has been sent. Receiving the final framebuffer byte alone does not
 stop the server, avoiding a race that left browsers waiting at 100% upload.
+After queuing that response, firmware keeps the HTTP task alive for a one-second
+TCP drain grace period before stopping Wi-Fi, preventing a late connection
+reset before Safari receives the acknowledgement.
 
 The upload API has a five-minute inactivity timeout after the upload QR has
 finished refreshing. An authenticated heartbeat from the open local uploader
@@ -34,6 +37,19 @@ keeps the session active while the user chooses and edits a photo. An absolute
 forever. First-run provisioning remains available for three minutes. Tapping
 another button does not cancel an active session; it ends only after a
 successful upload or timeout.
+
+The 6 MB SPIFFS partition retains the most recently completed framebuffer
+across deep sleep. Writes use a pending file plus a recoverable rename, so an
+interrupted upload does not replace the last good image. If a QR session times
+out without an upload—or Wi-Fi cannot be restored after drawing the QR—the
+firmware reloads that framebuffer, performs one normal color refresh, and then
+sleeps. A device with no saved framebuffer yet leaves the QR visible.
+The first persistence-enabled boot may take longer while firmware formats the
+previously unused factory SPIFFS partition; the UART image tool allows up to
+two minutes for this one-time initialization.
+Persistence is performed on the flow-controlled HTTP upload path. UART image
+reception remains timing-sensitive and does not write SPIFFS concurrently;
+doing so can stall long enough to overrun the serial stream.
 
 The device-hosted editor also performs dithering in a Web Worker. This keeps
 its 15-second heartbeat and UI progress active while an iPhone processes all
@@ -89,6 +105,9 @@ The browser includes the session token in the exact per-session upload path.
 The API also continues to accept `POST /api/image` with the token in the
 `X-Upload-Token` header. The path form avoids an iOS Safari failure where the
 custom header could be absent after a large XHR body had been transmitted.
+Only the exact generated path is registered for the session, so successful
+route dispatch is the bearer-token check; legacy `/api/image` requests still
+use constant-time header comparison.
 
 The 4-bit source palette is the GxEPD2 encoding already used by the custom
 driver: 0 black, 1 white, 2 green, 3 blue, 4 red, and 5 yellow. The first pixel
@@ -106,8 +125,13 @@ quantizer.
   receives it.
 - CORS permits only `https://elohmeier.github.io`; wildcard origins are not
   used.
+- The device's own numeric HTTP origin is accepted for its same-origin Safari
+  uploader. It does not receive a CORS header because none is needed. The only
+  accepted cross-origin origin remains `https://elohmeier.github.io`.
 - The API requires an exact 960,000-byte body and does not allocate a second
   full framebuffer.
+- Only a complete, validated upload replaces the persisted framebuffer; a
+  backup filename protects the last good image during the final rename.
 - First-run access point passwords are generated randomly for each attempt.
 
 The local API uses HTTP. The token protects authorization, but image bytes can
@@ -119,6 +143,20 @@ The device-served page is deliberately only a small HTML shell. It loads the
 fixed `device-uploader.js` and `device-uploader.css` assets from GitHub Pages;
 the classic script executes in the local page's origin, so its API upload is
 same-origin while editor updates can be deployed without reflashing firmware.
+Asset URLs carry a protocol-version query so Safari does not reuse an older
+ten-minute GitHub Pages cache entry after firmware and uploader changes.
+The shell also rewrites the legacy `/api/image` XHR target to the current
+tokenized path, protecting active devices from older uploader JavaScript that
+iOS may retain despite cache busting. Uploads started during the QR refresh
+wait for the display bus instead of failing with a transient `503`.
+As a final compatibility path, a valid token on the initial local page URL
+binds that short-lived session to the browser's LAN address. A legacy
+`/api/image` request from the same address is then accepted even if Safari
+removes its custom header and ignores the inline endpoint rewrite.
+Authentication failures include non-secret diagnostics in the JSON error:
+route type, header length, peer and bound LAN addresses, origin state, and
+display readiness. The uploader displays this detail directly for field
+diagnosis without exposing the session token.
 
 ## Browser compatibility
 

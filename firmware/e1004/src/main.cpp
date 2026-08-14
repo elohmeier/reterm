@@ -2,6 +2,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <SPI.h>
+#include <SPIFFS.h>
 #include <Wire.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -34,20 +35,28 @@ constexpr uint8_t kTouchAddress = 0x44;
 constexpr uint32_t kUploadWindowMs = 5 * 60 * 1000;
 constexpr uint32_t kUploadAbsoluteMaxMs = 30 * 60 * 1000;
 constexpr char kAllowedOrigin[] = "https://elohmeier.github.io";
+constexpr char kSavedImagePath[] = "/current-image.bin";
+constexpr char kBackupImagePath[] = "/previous-image.bin";
+constexpr char kPendingImagePath[] = "/pending-image.bin";
 
 SPIClass epaperSpi(HSPI);
 GxEPD2_7C<GxEPD2_T133A01_1200x1600, 40> display(
     GxEPD2_T133A01_1200x1600(kCs, kDc, kReset, kBusy, kCs1, kEnable));
 WebServer server(80);
+File pendingImage;
+bool imageStorageReady = false;
 
 enum class StartupCommand { None, Image, Web };
 String sessionToken;
 String uartSessionToken;
+IPAddress authorizedClientIp;
+bool authorizedClientIpSet = false;
 uint8_t httpRow[kPackedRowBytes];
 size_t httpRowFill = 0;
 size_t httpBytes = 0;
 int16_t httpY = 0;
 int httpResult = 500;
+String httpAuthDebug;
 volatile bool imageReady = false;
 volatile bool httpTaskRunning = false;
 volatile bool acceptingImages = false;
@@ -58,10 +67,79 @@ const char kLocalUploader[] PROGMEM = R"HTML(<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>reTerminal Photo Magic</title>
-<link rel="stylesheet" href="https://elohmeier.github.io/reterm/device-uploader.css">
+<link rel="stylesheet" href="https://elohmeier.github.io/reterm/device-uploader.css?v=2">
 <div id="reterm-uploader">Loading photo editor…</div>
-<script>window.RETERM_TOKEN=new URLSearchParams(location.search).get('token')||''</script>
-<script defer src="https://elohmeier.github.io/reterm/device-uploader.js"></script>)HTML";
+<script>
+window.RETERM_TOKEN=new URLSearchParams(location.search).get('token')||'';
+// Keep cached pre-v2 uploader scripts compatible. Some iOS Safari versions
+// reuse them despite a new QR navigation and omit their custom token header.
+const retermOpen=XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open=function(method,url,...rest){
+  if(method==='POST'&&url==='/api/image')
+    url='/api/image/'+encodeURIComponent(window.RETERM_TOKEN);
+  return retermOpen.call(this,method,url,...rest);
+};
+</script>
+<script defer src="https://elohmeier.github.io/reterm/device-uploader.js?v=2"></script>)HTML";
+
+void abortPendingImage() {
+  if (pendingImage) pendingImage.close();
+  if (imageStorageReady && SPIFFS.exists(kPendingImagePath))
+    SPIFFS.remove(kPendingImagePath);
+}
+
+bool beginPendingImage() {
+  if (!imageStorageReady) return false;
+  abortPendingImage();
+  pendingImage = SPIFFS.open(kPendingImagePath, FILE_WRITE);
+  return bool(pendingImage);
+}
+
+bool commitPendingImage() {
+  if (!pendingImage) return false;
+  pendingImage.flush();
+  pendingImage.close();
+
+  if (SPIFFS.exists(kBackupImagePath)) SPIFFS.remove(kBackupImagePath);
+  if (SPIFFS.exists(kSavedImagePath) &&
+      !SPIFFS.rename(kSavedImagePath, kBackupImagePath)) {
+    SPIFFS.remove(kPendingImagePath);
+    return false;
+  }
+  if (!SPIFFS.rename(kPendingImagePath, kSavedImagePath)) {
+    if (SPIFFS.exists(kBackupImagePath))
+      SPIFFS.rename(kBackupImagePath, kSavedImagePath);
+    return false;
+  }
+  if (SPIFFS.exists(kBackupImagePath)) SPIFFS.remove(kBackupImagePath);
+  return true;
+}
+
+bool restoreSavedImage() {
+  if (!imageStorageReady) return false;
+  const char *path = SPIFFS.exists(kSavedImagePath) ? kSavedImagePath
+                                                    : kBackupImagePath;
+  File saved = SPIFFS.open(path, FILE_READ);
+  if (!saved || saved.size() != kPackedImageBytes) {
+    if (saved) saved.close();
+    return false;
+  }
+
+  uint8_t row[kPackedRowBytes];
+  Serial.println("Restoring saved image after unused upload session");
+  for (int16_t y = 0; y < 1600; ++y) {
+    if (saved.read(row, sizeof(row)) != sizeof(row)) {
+      saved.close();
+      return false;
+    }
+    display.epd2.writeNative(row, nullptr, 0, y, 1200, 1);
+  }
+  saved.close();
+  display.epd2.refresh(false);
+  display.hibernate();
+  Serial.println("Saved image restored");
+  return true;
+}
 
 bool openTouchWindow() {
   if (digitalRead(kButton) == LOW) return true;
@@ -201,7 +279,8 @@ bool constantTimeToken(const String &candidate) {
 
 bool originAllowed() {
   const String origin = server.header("Origin");
-  return origin.isEmpty() || origin == kAllowedOrigin;
+  const String localOrigin = "http://" + WiFi.localIP().toString();
+  return origin.isEmpty() || origin == kAllowedOrigin || origin == localOrigin;
 }
 
 void addCorsHeaders() {
@@ -228,8 +307,38 @@ void handleOptions() {
 
 bool requestAuthorized() {
   if (!originAllowed()) return false;
+  // Only the exact, randomly generated per-session URI is registered with an
+  // image handler. If dispatch reached that handler, its path is already the
+  // bearer credential; avoid redundantly comparing mutable String storage.
+  if (server.uri().startsWith("/api/image/")) return true;
   if (constantTimeToken(server.header("X-Upload-Token"))) return true;
-  return server.uri() == "/api/image/" + sessionToken;
+  if (authorizedClientIpSet && server.client().remoteIP() == authorizedClientIp)
+    return true;
+  return false;
+}
+
+String requestAuthDebug() {
+  const String origin = server.header("Origin");
+  String detail = "route=";
+  detail += server.uri().startsWith("/api/image/") ? "tokenized" : "legacy";
+  detail += ", header=";
+  detail += server.header("X-Upload-Token").length();
+  detail += ", peer=";
+  detail += server.client().remoteIP().toString();
+  detail += ", bound=";
+  detail += authorizedClientIpSet ? authorizedClientIp.toString() : "none";
+  detail += ", origin=";
+  detail += origin.isEmpty() ? "none" : (originAllowed() ? "allowed" : "denied");
+  detail += ", ready=";
+  detail += acceptingImages ? "yes" : "no";
+  return detail;
+}
+
+void rememberAuthorizedClient() {
+  if (constantTimeToken(server.arg("token"))) {
+    authorizedClientIp = server.client().remoteIP();
+    authorizedClientIpSet = true;
+  }
 }
 
 void handleStatus() {
@@ -250,24 +359,40 @@ void handleStatus() {
 void handleRawImage() {
   HTTPRaw &raw = server.raw();
   if (raw.status == RAW_START) {
+    // The web shell can load while the slow QR refresh is still completing.
+    // Hold an early POST until the display bus is safe instead of forcing the
+    // user to retry after a transient 503.
+    const uint32_t readyDeadline = millis() + 60000;
+    while (!acceptingImages && httpTaskRunning &&
+           int32_t(readyDeadline - millis()) > 0) {
+      delay(10);
+    }
     httpRowFill = 0;
     httpBytes = 0;
     httpY = 0;
+    httpAuthDebug = requestAuthDebug();
     httpResult = acceptingImages && requestAuthorized() &&
                          server.clientContentLength() == kPackedImageBytes
                      ? 202
                      : (acceptingImages ? 401 : 503);
+    if (httpResult == 202 && !beginPendingImage()) httpResult = 507;
     if (httpResult == 202) sessionLastActivity = millis();
     if (requestAuthorized() &&
         server.clientContentLength() != kPackedImageBytes) httpResult = 413;
     return;
   }
   if (raw.status == RAW_ABORTED) {
+    abortPendingImage();
     httpResult = 400;
     return;
   }
   if (raw.status == RAW_WRITE && httpResult == 202) {
     sessionLastActivity = millis();
+    if (pendingImage.write(raw.buf, raw.currentSize) != raw.currentSize) {
+      abortPendingImage();
+      httpResult = 507;
+      return;
+    }
     size_t input = 0;
     while (input < raw.currentSize) {
       const size_t count = min(sizeof(httpRow) - httpRowFill,
@@ -287,9 +412,11 @@ void handleRawImage() {
     return;
   }
   if (raw.status == RAW_END && httpResult == 202) {
-    if (httpBytes == kPackedImageBytes && httpY == 1600 && httpRowFill == 0) {
+    if (httpBytes == kPackedImageBytes && httpY == 1600 && httpRowFill == 0 &&
+        commitPendingImage()) {
       imageReady = true;
     } else {
+      abortPendingImage();
       httpResult = 400;
     }
   }
@@ -305,9 +432,14 @@ void handleImageResult() {
   } else if (httpResult == 413) {
     server.send(413, "application/json", "{\"error\":\"expected 960000 bytes\"}");
   } else if (httpResult == 401) {
-    server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+    Serial.print("Upload unauthorized: ");
+    Serial.println(httpAuthDebug);
+    server.send(401, "application/json",
+                "{\"error\":\"unauthorized (" + httpAuthDebug + ")\"}");
   } else if (httpResult == 503) {
     server.send(503, "application/json", "{\"error\":\"display is starting\"}");
+  } else if (httpResult == 507) {
+    server.send(507, "application/json", "{\"error\":\"could not save image\"}");
   } else {
     server.send(400, "application/json", "{\"error\":\"incomplete image\"}");
   }
@@ -327,6 +459,7 @@ void startUploadServer() {
                            "Access-Control-Request-Private-Network"};
   server.collectHeaders(headers, 4);
   server.on("/", HTTP_GET, [] {
+    rememberAuthorizedClient();
     server.sendHeader("Cache-Control", "no-store");
     server.send_P(200, "text/html", kLocalUploader);
   });
@@ -539,6 +672,7 @@ void drawUploadQr(const String &url) {
 void runUploadSession() {
   Serial.println("Starting Wi-Fi upload session");
   sessionToken = uartSessionToken.isEmpty() ? makeToken() : uartSessionToken;
+  authorizedClientIpSet = false;
   uartSessionToken = "";
   // Serving the uploader from the E1004 makes Safari's upload same-origin.
   // Use the assigned numeric address: multicast DNS is unreliable on guest or
@@ -565,6 +699,7 @@ void runUploadSession() {
       httpTaskRunning = false;
       delay(10);
       server.stop();
+      if (!restoreSavedImage()) Serial.println("No saved image available to restore");
       return;
     }
     Serial.print("Wi-Fi restored at http://");
@@ -586,6 +721,10 @@ void runUploadSession() {
     }
     delay(2);
   }
+  // server.send() can return once the small 202 response is queued locally.
+  // Keep the HTTP task and socket alive long enough for the peer to ACK it;
+  // stopping after the old 10 ms grace could emit a TCP reset on real Wi-Fi.
+  if (uploadResponseSent) delay(1000);
   acceptingImages = false;
   httpTaskRunning = false;
   delay(10);
@@ -599,6 +738,7 @@ void runUploadSession() {
     Serial.println("HTTP image displayed");
   } else {
     Serial.println("Upload timed out");
+    if (!restoreSavedImage()) Serial.println("No saved image available to restore");
   }
 }
 
@@ -616,6 +756,9 @@ void setup() {
                          SPISettings(10000000, MSBFIRST, SPI_MODE0));
   display.init(115200);
   display.setRotation(0);
+  imageStorageReady = SPIFFS.begin(true);
+  Serial.print("Image storage ready = ");
+  Serial.println(imageStorageReady ? "yes" : "no");
 
   pinMode(kButton, INPUT_PULLUP);
   const bool buttonWake =
