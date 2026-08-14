@@ -158,14 +158,28 @@
   }
 
   function localRequest(url: string, init: RequestInit) {
-    return new Request(url, { ...init, mode: 'cors', targetAddressSpace: 'local' } as RequestInit);
+    // Chromium requires the Local Network Access hint. WebKit currently fails
+    // the entire request when this Chromium-specific option is present.
+    const chromium = /(?:Chrome|Chromium|Edg)\//.test(navigator.userAgent) &&
+      !/(?:CriOS|EdgiOS)\//.test(navigator.userAgent);
+    const options = chromium
+      ? { ...init, mode: 'cors', targetAddressSpace: 'local' }
+      : { ...init, mode: 'cors' };
+    return new Request(url, options as RequestInit);
   }
 
   async function upload() {
     if (!packed || !device || !token) return;
     busy = true;
-    status = 'Requesting local-network access and uploading 960 KB…';
+    status = 'Checking the local display…';
     try {
+      const headers = { 'X-Upload-Token': token };
+      const statusResponse = await fetch(localRequest(`${device}/api/status`, { headers }));
+      if (!statusResponse.ok) {
+        const result = await statusResponse.json().catch(() => ({}));
+        throw new Error(result.error ?? `display returned HTTP ${statusResponse.status}`);
+      }
+      status = 'Uploading 960 KB to the display…';
       const response = await fetch(localRequest(`${device}/api/image`, {
         method: 'POST',
         headers: {
@@ -180,7 +194,7 @@
       token = '';
       history.replaceState(null, '', location.pathname);
     } catch (error) {
-      status = `Upload failed: ${String(error)}. Allow local-network access and try again.`;
+      status = `Upload failed: ${describeError(error)}. Keep this phone on the same non-guest Wi-Fi as the display, then try again.`;
     } finally {
       busy = false;
     }

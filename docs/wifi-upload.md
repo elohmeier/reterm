@@ -85,12 +85,12 @@ ownership and trust design.
 
 ## Browser compatibility
 
-The Pages site requests the emerging Local Network Access capability by
-constructing requests with `targetAddressSpace: "local"`. Current Chromium
-and Edge builds can prompt the user for permission and allow an HTTPS page to
-reach an HTTP private address. Browser support is not uniform, particularly
-on older Safari and Firefox releases. The USB/UART `tools/send-image.sh` path
-remains the reliable fallback.
+The Pages site requests the emerging Local Network Access capability with
+`targetAddressSpace: "local"` on Chromium and Edge. WebKit receives the same
+CORS request without that Chromium-specific hint because affected Safari
+versions fail the request when it is present. Browser support is not uniform,
+particularly on older Safari and Firefox releases. The USB/UART
+`tools/send-image.sh` path remains the reliable fallback.
 
 The phone and E1004 must also be allowed to communicate with each other on the
 local WLAN. Guest networks and access points with client/AP isolation enabled
