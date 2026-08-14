@@ -5,6 +5,7 @@ Seeed Studio reTerminal E1001 and E1004. It contains:
 
 - `firmware/bringup`: a small custom, offline display bring-up image;
 - `firmware/e1004`: a custom color display image for the 13.3-inch E1004;
+- `site`: the static SvelteKit photo crop, dither, and Wi-Fi upload app;
 - `upstream/seeed-trmnl-1.8.10`: the official open-source firmware snapshot;
 - `upstream/seeed-trmnl-e1004-1.8.10`: the E1004 firmware snapshot;
 - `upstream/binaries/trmnl-1.8.10`: matching official release binaries; and
@@ -45,6 +46,17 @@ sh tools/send-image.sh /path/to/photo.jpg --no-flash
 
 A dithered PNG preview is written to
 `/root/.cache/reterm-e1004-preview.png` before the image is sent.
+
+## Wireless photo upload
+
+Press the E1004 button while it sleeps to open a temporary wireless upload
+session. On first use, scan the displayed Wi-Fi QR and use the captive portal
+to save a home network. The device then displays a one-time QR for the GitHub
+Pages uploader. The browser performs all resizing and six-pigment dithering,
+then streams the same 960,000-byte packed framebuffer used by the UART tool.
+
+See [docs/wifi-upload.md](docs/wifi-upload.md) for the state machine, API,
+security model, GitHub Pages deployment, and browser compatibility notes.
 
 The initial bring-up image has been built, flashed at factory app0 offset
 `0x90000`, and visually verified on the connected E1001.

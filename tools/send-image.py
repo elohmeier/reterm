@@ -91,7 +91,7 @@ def wait_for_ready(port: str) -> serial.Serial:
             except UnicodeDecodeError:
                 continue  # ROM boot output uses a different baud rate.
             print(f"device: {text}")
-            if text.startswith("READY E1004IMG"):
+            if text.startswith("READY E1004"):
                 return device
     device.close()
     raise RuntimeError("device did not announce image receiver")

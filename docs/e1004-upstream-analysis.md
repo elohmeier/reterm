@@ -103,3 +103,8 @@ into the PSRAM framebuffer before one full refresh.
 decoding, EXIF correction, automatic rotation, cover/contain scaling,
 six-pigment Floyd-Steinberg dithering, receiver build/flash, data transfer, and
 refresh verification.
+
+The receiver now also exposes the same packed framebuffer over a temporary,
+token-authenticated Wi-Fi API. Button wake, first-run captive provisioning,
+QR session handoff, CORS, deep sleep, and the browser uploader are documented
+in `docs/wifi-upload.md`.

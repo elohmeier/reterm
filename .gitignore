@@ -4,3 +4,6 @@ firmware/bringup/*.so
 firmware/e1004/.pio/
 .venv/
 __pycache__/
+site/node_modules/
+site/.svelte-kit/
+site/build/
