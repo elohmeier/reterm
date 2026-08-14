@@ -1,40 +1,207 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
+  import { replaceState } from '$app/navigation';
   import heic2any from 'heic2any';
+  import '@fontsource/archivo/400.css';
+  import '@fontsource/archivo/600.css';
+  import '@fontsource/archivo-black';
+  import '@fontsource/caveat/700.css';
+  import '@fontsource/special-elite';
+  import { InkStudio, LOOKS, type LookId } from '$lib/editor';
+  import { INKINGS, PIGMENTS, SCREEN_HEIGHT, SCREEN_WIDTH, type InkingId } from '$lib/pigments';
+  import { STICKERS } from '$lib/stickers';
+  import {
+    describeError,
+    readSession,
+    startHeartbeat,
+    uploadPacked,
+    type Session
+  } from '$lib/upload';
 
-  const width = 1200;
-  const height = 1600;
-  let source: ImageBitmap | HTMLImageElement | null = null;
-  let previewCanvas: HTMLCanvasElement;
-  let resultCanvas: HTMLCanvasElement;
-  let device = '';
-  let token = '';
-  let fit: 'cover' | 'contain' = 'cover';
-  let rotation = 0;
-  let zoom = 1;
-  let offsetX = 0;
-  let offsetY = 0;
-  let status = 'Scan the QR code on your E1004 to begin.';
-  let busy = false;
-  let packed: Uint8Array | null = null;
+  const CANVAS_FONTS = [
+    { family: 'Archivo Black', label: 'Poster' },
+    { family: 'Caveat', label: 'Marker' },
+    { family: 'Special Elite', label: 'Typed' }
+  ];
+
+  let stageEl: HTMLCanvasElement;
+  let proofEl: HTMLCanvasElement;
+  let mountEl: HTMLDivElement;
+  let studio = $state<InkStudio | null>(null);
+
+  let session = $state<Session | null>(null);
+  let statusText = $state('');
+  let statusTone = $state<'idle' | 'ok' | 'busy' | 'error'>('idle');
+  let busy = $state(false);
+  let sending = $state(false);
+  let view = $state<'photo' | 'ink'>('photo');
+  let tool = $state<'move' | 'text' | 'stickers' | 'draw'>('move');
+  let ink = $state<string>(PIGMENTS[0].hex);
+  let brushWidth = $state(16);
+  let inking = $state<InkingId>('floyd');
+  let look = $state<LookId>('none');
+  let brightness = $state(0);
+  let contrast = $state(0);
+  let saturation = $state(0);
+  let hasPhoto = $state(false);
+  let hasContent = $state(false);
+  let selected = $state({ count: 0, recolorable: false });
+  let proofState = $state<'stale' | 'cooking' | 'fresh'>('stale');
+  let inkProgress = $state(0);
+
+  let stopHeartbeat: (() => void) | null = null;
+  let proofTimer: ReturnType<typeof setTimeout> | undefined;
+  let worker: Worker | null = null;
+  let finishProof: ((packed: Uint8Array | null) => void) | null = null;
+  let proofPacked: Uint8Array | null = null;
+
+  function setStatus(tone: typeof statusTone, text: string) {
+    statusTone = tone;
+    statusText = text;
+  }
+
+  function adoptSession() {
+    const next = readSession();
+    if (!next) return;
+    stopHeartbeat?.();
+    session = next;
+    setStatus('ok', 'Frame connected — take your time, the session stays open while you edit.');
+    stopHeartbeat = startHeartbeat(next, () => {
+      session = null;
+      setStatus('error', 'The session ended. Press any button on the frame for a fresh QR.');
+    });
+  }
 
   onMount(() => {
-    const params = new URLSearchParams(location.hash.slice(1));
-    device = (params.get('device') ?? '').replace(/\/$/, '');
-    token = params.get('token') ?? '';
-    if (device && token) status = 'Connected link received. Choose a photo.';
+    adoptSession();
+    if (!session) {
+      setStatus(
+        'idle',
+        'No frame linked — press a button on your E1004 and scan its QR. Designing works without one.'
+      );
+    }
+
+    const instance = new InkStudio(stageEl, markDirty, (state) => (selected = state));
+    instance.mountProofLayer(proofEl);
+    proofEl.classList.add('proof');
+    studio = instance;
+    const observer = new ResizeObserver(() => instance.resize(mountEl.clientWidth));
+    observer.observe(mountEl);
+    instance.resize(mountEl.clientWidth);
+    for (const font of CANVAS_FONTS) void document.fonts.load(`400 32px "${font.family}"`);
+
+    return () => {
+      observer.disconnect();
+      stopHeartbeat?.();
+      clearTimeout(proofTimer);
+      worker?.terminate();
+      instance.dispose();
+    };
   });
 
-  function describeError(error: unknown): string {
-    if (error instanceof Error) return error.message || error.name;
-    if (typeof error === 'string') return error;
-    try {
-      const json = JSON.stringify(error);
-      if (json && json !== '{}') return json;
-    } catch {
-      // Fall through for non-serializable browser/library errors.
+  onDestroy(() => clearTimeout(proofTimer));
+
+  $effect(() => {
+    studio?.setBrush(ink, brushWidth);
+  });
+  $effect(() => {
+    studio?.setDrawMode(tool === 'draw');
+  });
+  $effect(() => {
+    studio?.setAdjust({ brightness, contrast, saturation });
+  });
+
+  function markDirty() {
+    proofState = 'stale';
+    proofPacked = null;
+    hasPhoto = studio?.hasPhoto() ?? false;
+    hasContent = !(studio?.isEmpty() ?? true);
+    scheduleProof();
+  }
+
+  function scheduleProof(delay = 300) {
+    clearTimeout(proofTimer);
+    if (view !== 'ink') return;
+    if (!studio || studio.isEmpty()) {
+      proofEl?.getContext('2d')?.clearRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+      return;
     }
-    return String(error);
+    proofTimer = setTimeout(() => void runProof(), delay);
+  }
+
+  function runProof(): Promise<Uint8Array | null> {
+    finishProof?.(null);
+    finishProof = null;
+    worker?.terminate();
+    if (!studio || studio.isEmpty()) return Promise.resolve(null);
+    proofState = 'cooking';
+    inkProgress = 0;
+    const image = studio.exportFrame();
+    const job = new Worker(new URL('../lib/dither.worker.ts', import.meta.url), { type: 'module' });
+    worker = job;
+    return new Promise((resolve) => {
+      const finish = (packed: Uint8Array | null) => {
+        if (finishProof === finish) finishProof = null;
+        if (worker === job) worker = null;
+        job.terminate();
+        resolve(packed);
+      };
+      finishProof = finish;
+      job.onmessage = (event) => {
+        if (typeof event.data.progress === 'number') {
+          inkProgress = event.data.progress;
+          return;
+        }
+        const preview = new Uint8ClampedArray(event.data.preview);
+        proofEl.getContext('2d')!.putImageData(new ImageData(preview, SCREEN_WIDTH, SCREEN_HEIGHT), 0, 0);
+        proofPacked = new Uint8Array(event.data.packed);
+        proofState = 'fresh';
+        finish(proofPacked);
+      };
+      job.onerror = () => {
+        proofState = 'stale';
+        finish(null);
+      };
+      job.postMessage(
+        { rgba: image.data.buffer, width: SCREEN_WIDTH, height: SCREEN_HEIGHT, inking, wantPacked: true },
+        [image.data.buffer]
+      );
+    });
+  }
+
+  function setView(next: 'photo' | 'ink') {
+    view = next;
+    if (next === 'ink' && proofState === 'stale') scheduleProof(0);
+  }
+
+  function chooseInking(id: InkingId) {
+    inking = id;
+    proofState = 'stale';
+    proofPacked = null;
+    setView('ink');
+  }
+
+  function chooseLook(id: LookId) {
+    look = id;
+    studio?.setLook(id);
+  }
+
+  function chooseInk(hex: string) {
+    ink = hex;
+    if (selected.recolorable) studio?.recolorSelection(hex);
+  }
+
+  async function addText(family: string) {
+    await document.fonts.load(`400 32px "${family}"`);
+    studio?.addText(family, ink);
+  }
+
+  async function addDateStamp() {
+    await document.fonts.load('400 32px "Special Elite"');
+    const stamp = new Date()
+      .toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+      .toUpperCase();
+    studio?.addText('Special Elite', ink, stamp);
   }
 
   async function decodeBlob(blob: Blob): Promise<ImageBitmap | HTMLImageElement> {
@@ -58,205 +225,722 @@
     }
   }
 
-  function releaseSource() {
-    if (source instanceof ImageBitmap) source.close();
-    source = null;
-  }
-
   async function choose(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
-    const selected = input.files?.[0];
-    if (!selected) return;
+    const selectedFile = input.files?.[0];
+    input.value = '';
+    if (!selectedFile || !studio) return;
     busy = true;
-    status = 'Decoding photo…';
+    setStatus('busy', 'Developing your photo…');
     try {
-      const isHeic = /hei[cf]/i.test(selected.type) || /\.hei[cf]$/i.test(selected.name);
-      let decodedSource: ImageBitmap | HTMLImageElement;
+      const isHeic =
+        /hei[cf]/i.test(selectedFile.type) || /\.hei[cf]$/i.test(selectedFile.name);
+      let decoded: ImageBitmap | HTMLImageElement;
       try {
         // Safari can decode HEIC natively even when createImageBitmap cannot.
-        decodedSource = await decodeBlob(selected);
+        decoded = await decodeBlob(selectedFile);
       } catch (nativeError) {
         if (!isHeic) throw nativeError;
         try {
-          const converted = await heic2any({ blob: selected, toType: 'image/jpeg', quality: 0.95 });
+          const converted = await heic2any({ blob: selectedFile, toType: 'image/jpeg', quality: 0.95 });
           const jpeg = Array.isArray(converted) ? converted[0] : converted;
           if (!(jpeg instanceof Blob)) throw new Error('converter returned no image');
-          decodedSource = await decodeBlob(jpeg);
+          decoded = await decodeBlob(jpeg);
         } catch (conversionError) {
           throw new Error(
             `native HEIC support failed (${describeError(nativeError)}); ` +
-            `HEIC conversion failed (${describeError(conversionError)})`
+              `HEIC conversion failed (${describeError(conversionError)})`
           );
         }
       }
-      releaseSource();
-      source = decodedSource;
-      const normalError = Math.abs(Math.log((source.width / source.height) / (width / height)));
-      const rotatedError = Math.abs(Math.log((source.height / source.width) / (width / height)));
-      rotation = rotatedError < normalError ? 90 : 0;
-      zoom = 1;
-      offsetX = 0;
-      offsetY = 0;
-      packed = null;
-      draw(previewCanvas, 450, 600);
-      status = rotation ? 'Photo loaded and auto-rotated.' : 'Photo loaded.';
+      studio.setPhoto(decoded);
+      tool = 'move';
+      view = 'photo';
+      setStatus(
+        session ? 'ok' : 'idle',
+        'Photo on the bench. Drag to place it, then pick an inking.'
+      );
     } catch (error) {
-      status = `Could not decode this photo: ${describeError(error)}`;
+      setStatus('error', `Could not decode this photo: ${describeError(error)}`);
     } finally {
       busy = false;
     }
   }
 
-  function draw(canvas: HTMLCanvasElement, targetWidth: number, targetHeight: number) {
-    if (!source || !canvas) return;
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
-    const context = canvas.getContext('2d', { alpha: false })!;
-    context.fillStyle = 'white';
-    context.fillRect(0, 0, targetWidth, targetHeight);
-    const radians = rotation * Math.PI / 180;
-    const sideways = Math.abs(rotation % 180) === 90;
-    const orientedWidth = sideways ? source.height : source.width;
-    const orientedHeight = sideways ? source.width : source.height;
-    const scaleX = targetWidth / orientedWidth;
-    const scaleY = targetHeight / orientedHeight;
-    const scale = (fit === 'cover' ? Math.max(scaleX, scaleY) : Math.min(scaleX, scaleY)) * zoom;
-    context.save();
-    context.translate(targetWidth / 2 + offsetX * targetWidth * 0.35,
-                      targetHeight / 2 + offsetY * targetHeight * 0.35);
-    context.rotate(radians);
-    context.scale(scale, scale);
-    context.imageSmoothingEnabled = true;
-    context.imageSmoothingQuality = 'high';
-    context.drawImage(source, -source.width / 2, -source.height / 2);
-    context.restore();
-  }
-
-  function redraw() {
-    packed = null;
-    draw(previewCanvas, 450, 600);
-  }
-
-  async function dither() {
-    if (!source) return;
+  async function send() {
+    if (!session || !studio || studio.isEmpty()) return;
+    sending = true;
     busy = true;
-    status = 'Resizing and dithering 1.92 million pixels…';
-    draw(resultCanvas, width, height);
-    const context = resultCanvas.getContext('2d', { alpha: false })!;
-    const image = context.getImageData(0, 0, width, height);
-    const worker = new Worker(new URL('../lib/dither.worker.ts', import.meta.url), { type: 'module' });
-    const result = await new Promise<{ packed: ArrayBuffer; preview: ArrayBuffer }>((resolve, reject) => {
-      worker.onmessage = (event) => resolve(event.data);
-      worker.onerror = reject;
-      worker.postMessage({ rgba: image.data.buffer, width, height }, [image.data.buffer]);
-    });
-    worker.terminate();
-    packed = new Uint8Array(result.packed);
-    context.putImageData(new ImageData(new Uint8ClampedArray(result.preview), width, height), 0, 0);
-    status = 'Six-color preview ready.';
-    busy = false;
-  }
-
-  function localRequest(url: string, init: RequestInit) {
-    // Chromium requires the Local Network Access hint. WebKit currently fails
-    // the entire request when this Chromium-specific option is present.
-    const chromium = /(?:Chrome|Chromium|Edg)\//.test(navigator.userAgent) &&
-      !/(?:CriOS|EdgiOS)\//.test(navigator.userAgent);
-    const options = chromium
-      ? { ...init, mode: 'cors', targetAddressSpace: 'local' }
-      : { ...init, mode: 'cors' };
-    return new Request(url, options as RequestInit);
-  }
-
-  async function upload() {
-    if (!packed || !device || !token) return;
-    busy = true;
-    status = 'Checking the local display…';
+    studio.deselect();
+    setView('ink');
     try {
-      const headers = { 'X-Upload-Token': token };
-      const statusResponse = await fetch(localRequest(`${device}/api/status`, { headers }));
-      if (!statusResponse.ok) {
-        const result = await statusResponse.json().catch(() => ({}));
-        throw new Error(result.error ?? `display returned HTTP ${statusResponse.status}`);
-      }
-      status = 'Uploading 960 KB to the display…';
-      const response = await fetch(localRequest(`${device}/api/image/${encodeURIComponent(token)}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'X-Upload-Token': token
-        },
-        body: packed.buffer as ArrayBuffer
-      }));
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error ?? `HTTP ${response.status}`);
-      status = 'Photo received! The e-paper refresh takes about 30 seconds.';
-      token = '';
-      history.replaceState(null, '', location.pathname);
+      setStatus('busy', 'Pressing the inks…');
+      const packed = proofPacked ?? (await runProof());
+      if (!packed) throw new Error('the design changed mid-press — tap send again');
+      await uploadPacked(session, packed, (message) => setStatus('busy', message));
+      stopHeartbeat?.();
+      stopHeartbeat = null;
+      session = null;
+      replaceState(location.pathname, {});
+      setStatus('ok', 'Sent! The frame takes about 30 seconds to develop.');
     } catch (error) {
-      status = `Upload failed: ${describeError(error)}. Keep this phone on the same non-guest Wi-Fi as the display, then try again.`;
+      setStatus(
+        'error',
+        `Upload failed: ${describeError(error)}. Keep this phone on the same non-guest Wi-Fi as the frame, then try again.`
+      );
     } finally {
+      sending = false;
       busy = false;
     }
+  }
+
+  function onKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Delete' && event.key !== 'Backspace') return;
+    const target = event.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+    if (selected.count === 0) return;
+    event.preventDefault();
+    studio?.deleteSelection();
   }
 </script>
 
-<svelte:head><title>reTerminal Photo Magic</title></svelte:head>
+<svelte:head>
+  <title>Photo Magic · reTerminal E1004</title>
+</svelte:head>
+
+<svelte:window onkeydown={onKeydown} onhashchange={adoptSession} />
 
 <main>
-  <header>
-    <span class="sparkle">✦</span>
-    <div><p class="eyebrow">reTerminal E1004</p><h1>Photo Magic</h1></div>
-    <span class="sparkle green">✦</span>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">reTerminal E1004 · six-ink photo lab</p>
+      <h1>Photo Magic</h1>
+    </div>
+    <ul class="inkstrip" aria-hidden="true">
+      {#each PIGMENTS as pigment (pigment.hex)}
+        <li style:background={pigment.hex}></li>
+      {/each}
+    </ul>
   </header>
 
-  <p class="status" class:ready={device && token}>{status}</p>
+  <p class="ticket" data-tone={statusTone} role="status">
+    {statusText}{#if proofState === 'cooking' && sending}&nbsp;{inkProgress}%{/if}
+  </p>
 
-  <section class="workspace">
-    <div class="panel controls">
-      <label class="picker">Choose a photo<input type="file" accept="image/*,.heic,.heif" onchange={choose} /></label>
-
-      <div class="row">
-        <label>Fit<select bind:value={fit} onchange={redraw}><option value="cover">Fill screen</option><option value="contain">Fit whole photo</option></select></label>
-        <label>Rotation<select bind:value={rotation} onchange={redraw}><option value={0}>0°</option><option value={90}>90°</option><option value={-90}>−90°</option><option value={180}>180°</option></select></label>
+  <div class="studio">
+    <section class="bench">
+      <div class="frame" class:inked={view === 'ink'}>
+        <div class="panel-mount" bind:this={mountEl}>
+          <canvas bind:this={stageEl}></canvas>
+          <canvas bind:this={proofEl} width={SCREEN_WIDTH} height={SCREEN_HEIGHT}></canvas>
+          {#if !hasContent}
+            <div class="hint">
+              <p>Add a photo —<br />or start with stickers, ink, and a note.</p>
+            </div>
+          {/if}
+        </div>
       </div>
-      <label>Zoom <strong>{zoom.toFixed(2)}×</strong><input type="range" min="1" max="3" step="0.01" bind:value={zoom} oninput={redraw} /></label>
-      <label>Move left/right<input type="range" min="-1" max="1" step="0.01" bind:value={offsetX} oninput={redraw} /></label>
-      <label>Move up/down<input type="range" min="-1" max="1" step="0.01" bind:value={offsetY} oninput={redraw} /></label>
+      <div class="caption">
+        <div class="viewflip" role="group" aria-label="Preview mode">
+          <button class:active={view === 'photo'} onclick={() => setView('photo')}>Photo</button>
+          <button class:active={view === 'ink'} onclick={() => setView('ink')}>
+            Ink proof{#if proofState === 'cooking'}<span class="cooking" aria-hidden="true">…</span>{/if}
+          </button>
+        </div>
+        <span class="specs">1200 × 1600 · 6 inks</span>
+      </div>
+      {#if hasPhoto}
+        <div class="caption">
+          <div class="fitrow">
+            <button class="chip" onclick={() => studio?.fitPhoto('cover')}>Fill frame</button>
+            <button class="chip" onclick={() => studio?.fitPhoto('contain')}>Fit inside</button>
+          </div>
+        </div>
+      {/if}
+    </section>
 
-      <button class="secondary" onclick={dither} disabled={!source || busy}>Create six-color preview</button>
-      <button class="primary" onclick={upload} disabled={!packed || !device || !token || busy}>Send to display</button>
-    </div>
+    <section class="desk">
+      <div class="rail" role="toolbar" aria-label="Tools">
+        <label class="tool" class:busy>
+          <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><circle
+              cx="9"
+              cy="10"
+              r="1.7"
+            /><path d="M5 17l4.5-5 3.5 4 2.5-3 3.5 4" /></svg>
+          <span>{hasPhoto ? 'Replace' : 'Photo'}</span>
+          <input type="file" accept="image/*,.heic,.heif" onchange={choose} disabled={busy} />
+        </label>
+        <button
+          class="tool"
+          class:active={tool === 'text'}
+          aria-pressed={tool === 'text'}
+          onclick={() => (tool = tool === 'text' ? 'move' : 'text')}
+        >
+          <svg viewBox="0 0 24 24"><path d="M5 7V4h14v3M12 4v16M9 20h6" /></svg>
+          <span>Text</span>
+        </button>
+        <button
+          class="tool"
+          class:active={tool === 'stickers'}
+          aria-pressed={tool === 'stickers'}
+          onclick={() => (tool = tool === 'stickers' ? 'move' : 'stickers')}
+        >
+          <svg viewBox="-58 -58 116 116"
+            ><path
+              d="M 0 -50 C 6 -18 18 -6 50 0 C 18 6 6 18 0 50 C -6 18 -18 6 -50 0 C -18 -6 -6 -18 0 -50 Z"
+              fill="currentColor"
+              stroke="none"
+            /></svg>
+          <span>Stickers</span>
+        </button>
+        <button
+          class="tool"
+          class:active={tool === 'draw'}
+          aria-pressed={tool === 'draw'}
+          onclick={() => (tool = tool === 'draw' ? 'move' : 'draw')}
+        >
+          <svg viewBox="0 0 24 24"><path d="M4 20l1-4L16 5l3 3-11 11-4 1z" /><path d="M14 7l3 3" /></svg>
+          <span>Draw</span>
+        </button>
+        <button
+          class="tool danger"
+          disabled={selected.count === 0}
+          onclick={() => studio?.deleteSelection()}
+        >
+          <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" /></svg>
+          <span>Delete</span>
+        </button>
+      </div>
 
-    <div class="panel preview">
-      <div class="screen"><canvas bind:this={previewCanvas}></canvas></div>
-      <p>Crop preview</p>
-    </div>
-    <div class="panel preview" class:hidden={!packed}>
-      <div class="screen"><canvas bind:this={resultCanvas}></canvas></div>
-      <p>Actual pigment preview</p>
-    </div>
-  </section>
+      {#if tool === 'text'}
+        <div class="tray" aria-label="Add text">
+          {#each CANVAS_FONTS as font (font.family)}
+            <button class="chip fontchip" style:font-family={font.family} onclick={() => addText(font.family)}>
+              {font.label}
+            </button>
+          {/each}
+          <button class="chip fontchip" style:font-family="Special Elite" onclick={addDateStamp}>
+            Date stamp
+          </button>
+        </div>
+      {/if}
+
+      {#if tool === 'stickers'}
+        <div class="tray" aria-label="Stickers">
+          {#each STICKERS as sticker (sticker.id)}
+            <button class="stickerchip" title={sticker.label} onclick={() => studio?.addSticker(sticker)}>
+              <svg viewBox="-58 -58 116 116">
+                <path
+                  d={sticker.path}
+                  fill={sticker.fill}
+                  fill-opacity={sticker.opacity ?? 1}
+                  stroke={sticker.stroke ?? 'none'}
+                  stroke-width={sticker.strokeWidth ?? 0}
+                />
+              </svg>
+            </button>
+          {/each}
+        </div>
+      {/if}
+
+      {#if tool === 'draw'}
+        <div class="tray brushtray">
+          <label class="slider">
+            Brush size
+            <input type="range" min="6" max="60" step="2" bind:value={brushWidth} />
+          </label>
+        </div>
+      {/if}
+
+      <div class="wells">
+        <span class="wells-label">{selected.recolorable ? 'Repaint with' : 'Ink'}</span>
+        {#each PIGMENTS as pigment (pigment.hex)}
+          <button
+            class="well"
+            class:current={ink === pigment.hex}
+            style:background={pigment.hex}
+            aria-label={`${pigment.name} ink`}
+            aria-pressed={ink === pigment.hex}
+            onclick={() => chooseInk(pigment.hex)}
+          ></button>
+        {/each}
+      </div>
+
+      <fieldset class="panel">
+        <legend>Inking</legend>
+        <div class="chips">
+          {#each INKINGS as style (style.id)}
+            <button
+              class="chip inkingchip"
+              class:active={inking === style.id}
+              disabled={!hasContent}
+              onclick={() => chooseInking(style.id)}
+            >
+              <strong>{style.label}</strong>
+              <small>{style.detail}</small>
+            </button>
+          {/each}
+        </div>
+      </fieldset>
+
+      <fieldset class="panel" disabled={!hasPhoto}>
+        <legend>Photo look</legend>
+        <div class="chips">
+          {#each LOOKS as entry (entry.id)}
+            <button class="chip" class:active={look === entry.id} onclick={() => chooseLook(entry.id)}>
+              {entry.label}
+            </button>
+          {/each}
+        </div>
+        <label class="slider">
+          Brightness
+          <input type="range" min="-0.35" max="0.35" step="0.01" bind:value={brightness} />
+        </label>
+        <label class="slider">
+          Contrast
+          <input type="range" min="-0.35" max="0.35" step="0.01" bind:value={contrast} />
+        </label>
+        <label class="slider">
+          Color
+          <input type="range" min="-0.9" max="0.9" step="0.01" bind:value={saturation} />
+        </label>
+      </fieldset>
+
+      <div class="sendbar">
+        <button class="send" disabled={!session || !hasContent || busy} onclick={send}>
+          {sending ? 'Sending…' : 'Send to frame'}
+        </button>
+        <p class="sendnote">
+          {#if session}
+            960 KB over your Wi-Fi · the panel refresh takes about 30 seconds.
+          {:else}
+            Press a button on the frame and scan its QR to go live.
+          {/if}
+        </p>
+      </div>
+    </section>
+  </div>
 </main>
 
 <style>
-  :global(*) { box-sizing: border-box; }
-  :global(body) { margin: 0; color: #17213a; background: #fff7df; font-family: ui-rounded, "Avenir Next", system-ui, sans-serif; }
-  :global(button), :global(input), :global(select) { font: inherit; }
-  main { width: min(1180px, 94vw); margin: 0 auto; padding: 32px 0 70px; }
-  header { display: flex; justify-content: center; align-items: center; gap: 28px; text-align: center; }
-  h1 { margin: 0; font-size: clamp(2.6rem, 7vw, 5.5rem); line-height: .9; color: #1259ba; letter-spacing: -.05em; }
-  .eyebrow { margin: 0 0 8px; color: #d22538; font-weight: 900; letter-spacing: .18em; text-transform: uppercase; }
-  .sparkle { font-size: 4rem; color: #edb915; transform: rotate(12deg); }.sparkle.green { color: #159653; transform: rotate(-12deg); }
-  .status { max-width: 720px; margin: 26px auto; padding: 14px 20px; border: 3px solid #17213a; border-radius: 999px; background: white; text-align: center; font-weight: 800; box-shadow: 5px 5px 0 #17213a; }
-  .status.ready { border-color: #159653; box-shadow: 5px 5px 0 #159653; }
-  .workspace { display: grid; grid-template-columns: minmax(270px, .85fr) repeat(2, minmax(250px, 1fr)); gap: 22px; align-items: start; }
-  .panel { padding: 22px; border: 3px solid #17213a; border-radius: 28px; background: white; box-shadow: 7px 7px 0 #17213a; }
-  .controls { display: grid; gap: 20px; }.controls label { display: grid; gap: 7px; font-weight: 800; }.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  select, input[type="range"] { width: 100%; }.picker { padding: 17px; border-radius: 16px; background: #edb915; cursor: pointer; text-align: center; }.picker input { display: none; }
-  button { border: 3px solid #17213a; border-radius: 16px; padding: 15px 12px; font-weight: 900; cursor: pointer; box-shadow: 4px 4px 0 #17213a; }
-  button:disabled { opacity: .4; cursor: not-allowed; }.primary { color: white; background: #d22538; }.secondary { background: #68b9f1; }
-  .preview { text-align: center; }.screen { overflow: hidden; aspect-ratio: 3 / 4; border: 2px solid #17213a; background: #eee; }.screen canvas { width: 100%; height: 100%; display: block; object-fit: contain; image-rendering: auto; }.preview p { margin: 15px 0 0; font-weight: 900; }.hidden { visibility: hidden; }
-  @media (max-width: 900px) { .workspace { grid-template-columns: 1fr 1fr; }.controls { grid-column: 1 / -1; }.hidden { display: none; } }
-  @media (max-width: 600px) { main { padding-top: 20px; }.workspace { grid-template-columns: 1fr; }.controls { grid-column: auto; }.row { grid-template-columns: 1fr; }.sparkle { display: none; } }
+  :global(*) {
+    box-sizing: border-box;
+  }
+  :global(:root) {
+    --paper: #ece9e0;
+    --card: #ffffff;
+    --ink: #131313;
+    --muted: #6e6a5e;
+    --red: #d21e28;
+    --blue: #004bbe;
+    --green: #009146;
+    --yellow: #f5cd1e;
+    --line: 2px solid var(--ink);
+  }
+  :global(html) {
+    scroll-padding-bottom: 120px;
+  }
+  :global(body) {
+    margin: 0;
+    color: var(--ink);
+    background:
+      radial-gradient(rgba(19, 19, 19, 0.06) 1px, transparent 1.2px) 0 0 / 14px 14px,
+      var(--paper);
+    font-family: Archivo, 'Avenir Next', system-ui, sans-serif;
+  }
+  :global(button),
+  :global(input),
+  :global(select) {
+    font: inherit;
+    color: inherit;
+  }
+  :global(:focus-visible) {
+    outline: 3px solid var(--blue);
+    outline-offset: 2px;
+  }
+  :global(.proof) {
+    image-rendering: pixelated;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+  }
+  .frame.inked :global(.proof) {
+    opacity: 1;
+  }
+
+  main {
+    width: min(1080px, 100% - 28px);
+    margin: 0 auto;
+    padding: 22px 0 48px;
+  }
+
+  .masthead {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .eyebrow {
+    margin: 0 0 7px;
+    font-family: 'Special Elite', monospace;
+    font-size: 0.82rem;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+  }
+  h1 {
+    margin: 0;
+    font-family: 'Archivo Black', Archivo, sans-serif;
+    font-size: clamp(2.2rem, 6vw, 3.6rem);
+    line-height: 0.95;
+    letter-spacing: -0.02em;
+    text-shadow:
+      2px 2px 0 rgba(210, 30, 40, 0.55),
+      -2px -2px 0 rgba(0, 75, 190, 0.45);
+  }
+  .inkstrip {
+    display: flex;
+    gap: 6px;
+    margin: 0 0 10px;
+    padding: 0;
+    list-style: none;
+  }
+  .inkstrip li {
+    width: 15px;
+    height: 15px;
+    border: 2px solid var(--ink);
+    border-radius: 50%;
+  }
+
+  .ticket {
+    margin: 16px 0 20px;
+    padding: 11px 18px;
+    border: var(--line);
+    border-radius: 999px;
+    background: var(--card);
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .ticket[data-tone='ok'] {
+    border-color: var(--green);
+    box-shadow: 3px 3px 0 var(--green);
+  }
+  .ticket[data-tone='error'] {
+    border-color: var(--red);
+    box-shadow: 3px 3px 0 var(--red);
+  }
+  .ticket[data-tone='busy'] {
+    border-color: var(--blue);
+    box-shadow: 3px 3px 0 var(--blue);
+  }
+
+  .studio {
+    display: grid;
+    gap: 24px;
+  }
+  @media (min-width: 880px) {
+    .studio {
+      grid-template-columns: minmax(360px, 1fr) 400px;
+      align-items: start;
+    }
+    .bench {
+      position: sticky;
+      top: 16px;
+    }
+  }
+
+  .bench,
+  .desk {
+    min-width: 0;
+  }
+  .bench {
+    max-width: 480px;
+    width: 100%;
+    margin: 0 auto;
+  }
+  .panel-mount :global(.canvas-container) {
+    max-width: 100%;
+  }
+  .frame {
+    position: relative;
+    padding: 10px;
+    border: var(--line);
+    border-radius: 18px;
+    background: var(--card);
+    box-shadow: 7px 7px 0 var(--ink);
+  }
+  .panel-mount {
+    position: relative;
+    border-radius: 8px;
+    overflow: hidden;
+    outline: 1.5px solid #d9d5c9;
+    aspect-ratio: 3 / 4;
+  }
+  .hint {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    pointer-events: none;
+  }
+  .hint p {
+    margin: 16px;
+    padding: 14px 18px;
+    border: 2px dashed #b9b4a5;
+    border-radius: 12px;
+    color: var(--muted);
+    font-weight: 600;
+    text-align: center;
+  }
+
+  .caption {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .viewflip {
+    display: inline-flex;
+    border: var(--line);
+    border-radius: 999px;
+    background: var(--card);
+    overflow: hidden;
+  }
+  .viewflip button {
+    padding: 7px 14px;
+    border: none;
+    background: none;
+    font-weight: 700;
+    font-size: 0.88rem;
+    cursor: pointer;
+  }
+  .viewflip button.active {
+    background: var(--ink);
+    color: var(--card);
+  }
+  .cooking {
+    display: inline-block;
+    width: 1em;
+    text-align: left;
+  }
+  .specs {
+    font-family: 'Special Elite', monospace;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .fitrow {
+    display: flex;
+    gap: 8px;
+  }
+
+  .desk {
+    display: grid;
+    gap: 14px;
+    align-content: start;
+  }
+  .rail {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .tool {
+    display: grid;
+    justify-items: center;
+    gap: 3px;
+    min-width: 64px;
+    padding: 9px 10px 7px;
+    border: var(--line);
+    border-radius: 13px;
+    background: var(--card);
+    cursor: pointer;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .tool svg {
+    width: 21px;
+    height: 21px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .tool.active {
+    background: var(--yellow);
+    box-shadow: 3px 3px 0 var(--ink);
+  }
+  .tool:disabled,
+  .tool.busy {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .tool.danger {
+    color: var(--red);
+  }
+  .tool input {
+    display: none;
+  }
+
+  .tray {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 2px;
+  }
+  .stickerchip {
+    flex: 0 0 auto;
+    width: 54px;
+    height: 54px;
+    padding: 5px;
+    border: var(--line);
+    border-radius: 13px;
+    background: var(--card);
+    cursor: pointer;
+  }
+  .stickerchip svg {
+    width: 100%;
+    height: 100%;
+  }
+  .fontchip {
+    font-size: 1.02rem;
+  }
+  .brushtray {
+    padding: 4px 2px;
+  }
+
+  .wells {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .wells-label {
+    font-family: 'Special Elite', monospace;
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-right: 2px;
+  }
+  .well {
+    width: 30px;
+    height: 30px;
+    border: 2px solid var(--ink);
+    border-radius: 50%;
+    cursor: pointer;
+    padding: 0;
+  }
+  .well.current {
+    outline: 3px solid var(--ink);
+    outline-offset: 2px;
+  }
+
+  .panel {
+    margin: 0;
+    padding: 12px 14px 14px;
+    border: var(--line);
+    border-radius: 15px;
+    background: var(--card);
+    display: grid;
+    gap: 11px;
+  }
+  .panel[disabled] {
+    opacity: 0.55;
+  }
+  legend {
+    padding: 0 6px;
+    font-family: 'Special Elite', monospace;
+    font-size: 0.84rem;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+  }
+  .chip {
+    padding: 7px 12px;
+    border: var(--line);
+    border-radius: 999px;
+    background: var(--card);
+    font-weight: 600;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .chip.active {
+    background: var(--ink);
+    color: var(--card);
+  }
+  .chip:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .inkingchip {
+    display: grid;
+    gap: 1px;
+    justify-items: start;
+    border-radius: 12px;
+    text-align: left;
+  }
+  .inkingchip small {
+    font-weight: 400;
+    font-size: 0.68rem;
+    opacity: 0.75;
+  }
+  .slider {
+    display: grid;
+    gap: 4px;
+    font-weight: 600;
+    font-size: 0.85rem;
+  }
+  .slider input {
+    width: 100%;
+    accent-color: var(--blue);
+  }
+
+  .sendbar {
+    position: sticky;
+    bottom: 10px;
+    display: grid;
+    gap: 5px;
+    padding: 8px;
+    border: var(--line);
+    border-radius: 16px;
+    background: var(--card);
+    box-shadow: 0 -6px 18px rgba(19, 19, 19, 0.08);
+  }
+  .send {
+    padding: 14px;
+    border: var(--line);
+    border-radius: 12px;
+    background: var(--red);
+    color: #fff;
+    font-family: 'Archivo Black', Archivo, sans-serif;
+    font-size: 1.02rem;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    box-shadow: 4px 4px 0 var(--ink);
+  }
+  .send:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    box-shadow: none;
+  }
+  .send:not(:disabled):active {
+    translate: 2px 2px;
+    box-shadow: 2px 2px 0 var(--ink);
+  }
+  .sendnote {
+    margin: 0;
+    text-align: center;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    :global(.proof) {
+      transition: none;
+    }
+    .send:not(:disabled):active {
+      translate: none;
+    }
+  }
 </style>

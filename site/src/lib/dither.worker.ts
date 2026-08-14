@@ -1,68 +1,145 @@
-const palette = [
-  [0, 0, 0],
-  [255, 255, 255],
-  [0, 145, 70],
-  [0, 75, 190],
-  [210, 30, 40],
-  [245, 205, 30]
-] as const;
+// Quantizes an RGBA frame to the six Spectra pigments and packs two 4-bit
+// palette indices per byte (first pixel in the high nibble), matching the
+// firmware's GxEPD2 encoding. Several inking styles share one code path.
+import { PIGMENTS, type InkingId } from './pigments';
 
-self.onmessage = (event: MessageEvent<{ rgba: ArrayBuffer; width: number; height: number }>) => {
-  const { rgba, width, height } = event.data;
+type Job = {
+  rgba: ArrayBuffer;
+  width: number;
+  height: number;
+  inking: InkingId;
+  wantPacked: boolean;
+};
+
+// Error-diffusion kernels as [dx, dy, weight]. dx is mirrored on
+// right-to-left rows (serpentine scanning hides directional worm artifacts).
+const KERNELS: Record<string, [number, number, number][]> = {
+  floyd: [
+    [1, 0, 7 / 16],
+    [-1, 1, 3 / 16],
+    [0, 1, 5 / 16],
+    [1, 1, 1 / 16]
+  ],
+  atkinson: [
+    [1, 0, 1 / 8],
+    [2, 0, 1 / 8],
+    [-1, 1, 1 / 8],
+    [0, 1, 1 / 8],
+    [1, 1, 1 / 8],
+    [0, 2, 1 / 8]
+  ],
+  jarvis: [
+    [1, 0, 7 / 48],
+    [2, 0, 5 / 48],
+    [-2, 1, 3 / 48],
+    [-1, 1, 5 / 48],
+    [0, 1, 7 / 48],
+    [1, 1, 5 / 48],
+    [2, 1, 3 / 48],
+    [-2, 2, 1 / 48],
+    [-1, 2, 3 / 48],
+    [0, 2, 5 / 48],
+    [1, 2, 3 / 48],
+    [2, 2, 1 / 48]
+  ]
+};
+
+// prettier-ignore
+const BAYER8 = [
+  0, 32, 8, 40, 2, 34, 10, 42,
+  48, 16, 56, 24, 50, 18, 58, 26,
+  12, 44, 4, 36, 14, 46, 6, 38,
+  60, 28, 52, 20, 62, 30, 54, 22,
+  3, 35, 11, 43, 1, 33, 9, 41,
+  51, 19, 59, 27, 49, 17, 57, 25,
+  15, 47, 7, 39, 13, 45, 5, 37,
+  63, 31, 55, 23, 61, 29, 53, 21
+];
+const BAYER_SPREAD = 96;
+
+function nearest(red: number, green: number, blue: number): number {
+  let selected = 0;
+  let best = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < PIGMENTS.length; index += 1) {
+    const [r, g, b] = PIGMENTS[index].rgb;
+    const dr = red - r;
+    const dg = green - g;
+    const db = blue - b;
+    const distance = dr * dr * 0.3 + dg * dg * 0.59 + db * db * 0.11;
+    if (distance < best) {
+      best = distance;
+      selected = index;
+    }
+  }
+  return selected;
+}
+
+self.onmessage = (event: MessageEvent<Job>) => {
+  const { rgba, width, height, inking, wantPacked } = event.data;
   const source = new Uint8ClampedArray(rgba);
   const preview = new Uint8ClampedArray(source.length);
-  const packed = new Uint8Array(width * height / 2);
-  let current = new Float32Array((width + 2) * 3);
-  let next = new Float32Array((width + 2) * 3);
+  const packed = new Uint8Array((width * height) / 2);
+  const kernel = KERNELS[inking];
+
+  // Three rolling error rows with a two-pixel apron so kernels never bounds-check.
+  const rowSize = (width + 4) * 3;
+  let rows = [new Float32Array(rowSize), new Float32Array(rowSize), new Float32Array(rowSize)];
+  const progressStep = Math.max(1, Math.floor(height / 10));
 
   for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
+    const reverse = kernel !== undefined && (y & 1) === 1;
+    for (let step = 0; step < width; step += 1) {
+      const x = reverse ? width - 1 - step : step;
       const pixel = (y * width + x) * 4;
-      const error = (x + 1) * 3;
-      const red = Math.max(0, Math.min(255, source[pixel] + current[error]));
-      const green = Math.max(0, Math.min(255, source[pixel + 1] + current[error + 1]));
-      const blue = Math.max(0, Math.min(255, source[pixel + 2] + current[error + 2]));
-
-      let selected = 0;
-      let best = Number.POSITIVE_INFINITY;
-      for (let index = 0; index < palette.length; index += 1) {
-        const color = palette[index];
-        const dr = red - color[0];
-        const dg = green - color[1];
-        const db = blue - color[2];
-        const distance = dr * dr * 0.30 + dg * dg * 0.59 + db * db * 0.11;
-        if (distance < best) {
-          best = distance;
-          selected = index;
-        }
+      const error = (x + 2) * 3;
+      let red = source[pixel];
+      let green = source[pixel + 1];
+      let blue = source[pixel + 2];
+      if (kernel) {
+        red += rows[0][error];
+        green += rows[0][error + 1];
+        blue += rows[0][error + 2];
+      } else if (inking === 'bayer') {
+        const threshold = ((BAYER8[(y & 7) * 8 + (x & 7)] + 0.5) / 64 - 0.5) * BAYER_SPREAD;
+        red += threshold;
+        green += threshold;
+        blue += threshold;
       }
+      red = red < 0 ? 0 : red > 255 ? 255 : red;
+      green = green < 0 ? 0 : green > 255 ? 255 : green;
+      blue = blue < 0 ? 0 : blue > 255 ? 255 : blue;
 
-      const chosen = palette[selected];
-      preview[pixel] = chosen[0];
-      preview[pixel + 1] = chosen[1];
-      preview[pixel + 2] = chosen[2];
+      const selected = nearest(red, green, blue);
+      const [pr, pg, pb] = PIGMENTS[selected].rgb;
+      preview[pixel] = pr;
+      preview[pixel + 1] = pg;
+      preview[pixel + 2] = pb;
       preview[pixel + 3] = 255;
       const packedIndex = (y * width + x) >> 1;
       if ((x & 1) === 0) packed[packedIndex] = selected << 4;
       else packed[packedIndex] |= selected;
 
-      const er = red - chosen[0];
-      const eg = green - chosen[1];
-      const eb = blue - chosen[2];
-      for (let channel = 0; channel < 3; channel += 1) {
-        const value = channel === 0 ? er : channel === 1 ? eg : eb;
-        current[error + 3 + channel] += value * 7 / 16;
-        next[error - 3 + channel] += value * 3 / 16;
-        next[error + channel] += value * 5 / 16;
-        next[error + 3 + channel] += value / 16;
+      if (kernel) {
+        const er = red - pr;
+        const eg = green - pg;
+        const eb = blue - pb;
+        for (const [dx, dy, weight] of kernel) {
+          const target = (x + (reverse ? -dx : dx) + 2) * 3;
+          rows[dy][target] += er * weight;
+          rows[dy][target + 1] += eg * weight;
+          rows[dy][target + 2] += eb * weight;
+        }
       }
     }
-    current = next;
-    next = new Float32Array((width + 2) * 3);
+    const recycled = rows.shift()!;
+    recycled.fill(0);
+    rows.push(recycled);
+    if (wantPacked && (y + 1) % progressStep === 0) {
+      self.postMessage({ progress: Math.round(((y + 1) * 100) / height) });
+    }
   }
 
-  const post = self.postMessage as unknown as
-    (message: unknown, transfer: Transferable[]) => void;
-  post({ packed: packed.buffer, preview: preview.buffer },
-       [packed.buffer, preview.buffer]);
+  const post = self.postMessage as unknown as (message: unknown, transfer: Transferable[]) => void;
+  if (wantPacked) post({ packed: packed.buffer, preview: preview.buffer }, [packed.buffer, preview.buffer]);
+  else post({ preview: preview.buffer }, [preview.buffer]);
 };

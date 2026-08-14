@@ -5,7 +5,7 @@ Seeed Studio reTerminal E1001 and E1004. It contains:
 
 - `firmware/bringup`: a small custom, offline display bring-up image;
 - `firmware/e1004`: a custom color display image for the 13.3-inch E1004;
-- `site`: the static SvelteKit photo crop, dither, and Wi-Fi upload app;
+- `site`: the static SvelteKit six-ink photo editor and Wi-Fi upload app;
 - `upstream/seeed-trmnl-1.8.10`: the official open-source firmware snapshot;
 - `upstream/seeed-trmnl-e1004-1.8.10`: the E1004 firmware snapshot;
 - `upstream/binaries/trmnl-1.8.10`: matching official release binaries; and

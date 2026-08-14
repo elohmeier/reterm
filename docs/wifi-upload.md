@@ -12,7 +12,13 @@
    the upload same-origin on iOS Safari, which blocks an HTTPS GitHub Pages
    page from posting to a local plain-HTTP device. The full GitHub Pages editor
    remains available at `https://elohmeier.github.io/reterm/` for compatible
-   browsers.
+   browsers. That editor composes the photo with stickers, editable text, and
+   free-hand drawing on a fabric.js canvas, applies optional photo looks, and
+   offers five dithering styles with a live six-ink proof. It sends the same
+   authenticated 15-second `/api/status` heartbeat as the local uploader so
+   long editing sessions do not hit the inactivity timeout, and it adopts a
+   fresh `#device`/`token` hash without a reload if a new QR is scanned into
+   an already-open tab.
 5. The user chooses a JPEG, PNG, WebP, HEIC, or other browser-decodable image,
    then adjusts rotation, fill/contain mode, zoom, and position.
 6. A Web Worker resizes the image to 1200x1600, applies Floyd-Steinberg
