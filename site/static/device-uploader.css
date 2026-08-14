@@ -1,0 +1,15 @@
+* { box-sizing: border-box; }
+body { margin: 0; color: #17213a; background: #fff7df; font: 17px ui-rounded, system-ui, sans-serif; }
+#reterm-uploader { width: min(40rem, 94vw); margin: auto; padding: 1.2rem 0 3rem; }
+h1 { margin: .3rem 0; color: #1259ba; font-size: clamp(2.3rem, 12vw, 4rem); line-height: .95; }
+.status { padding: .8rem 1rem; border: 3px solid; border-radius: 1rem; background: white; font-weight: 800; }
+.card { display: grid; gap: 1rem; padding: 1rem; border: 3px solid; border-radius: 1.4rem; background: white; box-shadow: 6px 6px #17213a; }
+label { display: grid; gap: .35rem; font-weight: 800; }
+.pick, button { padding: 1rem; border: 3px solid; border-radius: 1rem; font: inherit; font-weight: 900; text-align: center; }
+.pick { display: block; background: #edb915; }
+.pick input { display: none; }
+select, input[type=range] { width: 100%; font: inherit; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+button { color: white; background: #d22538; }
+button:disabled { opacity: .45; }
+canvas { display: block; width: min(100%, 360px); aspect-ratio: 3/4; margin: auto; border: 2px solid; background: #eee; }

@@ -2,6 +2,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <GxEPD2_7C.h>
@@ -25,10 +26,14 @@ constexpr int kEnable = 12;
 constexpr uint32_t kImageBaud = 921600;
 constexpr size_t kPackedRowBytes = 1200 / 2;
 constexpr size_t kPackedImageBytes = kPackedRowBytes * 1600;
-constexpr gpio_num_t kButton = GPIO_NUM_0;
+// The three E1004 capacitive controls are channels of an IQS323. Its shared
+// active-low RDY/interrupt output is wired to ESP32-S3 GPIO 3.
+constexpr gpio_num_t kButton = GPIO_NUM_3;
+constexpr int kTouchSda = 39;
+constexpr int kTouchScl = 40;
+constexpr uint8_t kTouchAddress = 0x44;
 constexpr uint32_t kUploadWindowMs = 60000;
 constexpr char kAllowedOrigin[] = "https://elohmeier.github.io";
-constexpr char kPagesUrl[] = "https://elohmeier.github.io/reterm/";
 
 SPIClass epaperSpi(HSPI);
 GxEPD2_7C<GxEPD2_T133A01_1200x1600, 40> display(
@@ -45,6 +50,63 @@ int16_t httpY = 0;
 int httpResult = 500;
 bool imageReady = false;
 bool cancelRequested = false;
+
+const char kLocalUploader[] PROGMEM = R"HTML(<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>reTerminal Photo Magic</title>
+<link rel="stylesheet" href="https://elohmeier.github.io/reterm/device-uploader.css">
+<div id="reterm-uploader">Loading photo editor…</div>
+<script>window.RETERM_TOKEN=new URLSearchParams(location.search).get('token')||''</script>
+<script defer src="https://elohmeier.github.io/reterm/device-uploader.js"></script>)HTML";
+
+bool openTouchWindow() {
+  if (digitalRead(kButton) == LOW) return true;
+  Wire.beginTransmission(kTouchAddress);
+  Wire.write(0xff);
+  if (Wire.endTransmission() != 0) return false;
+  const uint32_t deadline = millis() + 100;
+  while (digitalRead(kButton) == HIGH && int32_t(deadline - millis()) > 0) delay(1);
+  return digitalRead(kButton) == LOW;
+}
+
+bool writeTouchRegister(uint8_t address, uint8_t value) {
+  if (!openTouchWindow()) return false;
+  Wire.beginTransmission(kTouchAddress);
+  Wire.write(address);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool readTouchRegister(uint8_t address, uint8_t *data, size_t length) {
+  if (!openTouchWindow()) return false;
+  Wire.beginTransmission(kTouchAddress);
+  Wire.write(address);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(kTouchAddress, length) != length) return false;
+  for (size_t i = 0; i < length; ++i) data[i] = Wire.read();
+  return true;
+}
+
+void prepareTouchWake() {
+  // Tap mode reports changes from any of the three channels. Event mode then
+  // keeps RDY high during sleep except for a real touch/release event.
+  writeTouchRegister(0xa0, 0x09);
+  writeTouchRegister(0xd3, 0x02);
+  uint8_t control[2] = {};
+  if (readTouchRegister(0xc0, control, sizeof(control))) {
+    writeTouchRegister(0xc0, control[0] | 0x80);
+  }
+
+  // Reading status acknowledges any event that led us here. If a control is
+  // still held, wait briefly for release and acknowledge that transition too.
+  uint8_t status[18];
+  readTouchRegister(0x10, status, sizeof(status));
+  const uint32_t releaseDeadline = millis() + 1500;
+  while (digitalRead(kButton) == LOW &&
+         int32_t(releaseDeadline - millis()) > 0) delay(10);
+  if (digitalRead(kButton) == LOW) readTouchRegister(0x10, status, sizeof(status));
+}
 
 void centered(const char *text, int16_t baseline) {
   int16_t x1, y1;
@@ -113,6 +175,7 @@ void goToSleep() {
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
   pinMode(kButton, INPUT_PULLUP);
+  prepareTouchWake();
   esp_sleep_enable_ext0_wakeup(kButton, 0);
   delay(50);
   esp_deep_sleep_start();
@@ -438,14 +501,19 @@ void runUploadSession() {
 
   sessionToken = uartSessionToken.isEmpty() ? makeToken() : uartSessionToken;
   uartSessionToken = "";
-  const String device = "http%3A%2F%2F" + WiFi.localIP().toString();
-  const String qrUrl = String(kPagesUrl) + "#device=" + device +
-                       "&token=" + sessionToken;
+  // Serving the uploader from the E1004 makes Safari's upload same-origin;
+  // iOS otherwise blocks an HTTPS GitHub Pages fetch to this local HTTP API.
+  const String qrUrl = "http://" + WiFi.localIP().toString() +
+                       "/?token=" + sessionToken;
   drawUploadQr(qrUrl);
 
   const char *headers[] = {"Origin", "X-Upload-Token", "Content-Type",
                            "Access-Control-Request-Private-Network"};
   server.collectHeaders(headers, 4);
+  server.on("/", HTTP_GET, [] {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html", kLocalUploader);
+  });
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/image", HTTP_POST, handleImageResult, handleRawImage);
   server.on("/api/cancel", HTTP_POST, handleCancel);
@@ -578,6 +646,8 @@ void setup() {
   Serial.println("reterm E1004 custom color card: boot");
 
   epaperSpi.begin(kSck, kMiso, kMosi, -1);
+  Wire.begin(kTouchSda, kTouchScl);
+  Wire.setClock(100000);
   display.epd2.selectSPI(epaperSpi,
                          SPISettings(10000000, MSBFIRST, SPI_MODE0));
   display.init(115200);

@@ -2,14 +2,17 @@
 
 ## User flow
 
-1. Press the E1004 button while the device is sleeping.
+1. Tap any of the three E1004 capacitive buttons while the device is sleeping.
 2. On first use, scan the `SET UP WI-FI` QR. It joins a temporary,
    password-protected device network and opens a captive portal. The submitted
    credentials are stored only in the ESP32 `wificaptive` NVS namespace.
 3. Once connected to the home Wi-Fi, the E1004 generates a random 128-bit
    session token and displays a second QR.
-4. The QR opens `https://elohmeier.github.io/reterm/`. Its URL fragment carries
-   the local device address and token; URL fragments are not sent to GitHub.
+4. The QR opens a compact uploader served directly by the E1004. This keeps
+   the upload same-origin on iOS Safari, which blocks an HTTPS GitHub Pages
+   page from posting to a local plain-HTTP device. The full GitHub Pages editor
+   remains available at `https://elohmeier.github.io/reterm/` for compatible
+   browsers.
 5. The user chooses a JPEG, PNG, WebP, HEIC, or other browser-decodable image,
    then adjusts rotation, fill/contain mode, zoom, and position.
 6. A Web Worker resizes the image to 1200x1600, applies Floyd-Steinberg
@@ -22,7 +25,7 @@
 
 The upload API remains available for 60 seconds after the Pages QR has
 finished refreshing. First-run provisioning remains available for three
-minutes. Pressing the button during either window cancels it.
+minutes. Tapping a capacitive button during either window cancels it.
 
 ## HTTP API
 
@@ -70,8 +73,8 @@ Requires the session token and closes the session without changing the panel.
   and are compared without data-dependent early exit.
 - A token is valid for one short session and is cleared after upload, cancel,
   or timeout.
-- The token and device address use the QR URL fragment, so GitHub Pages and
-  referrer headers never receive them.
+- The local uploader's token is sent only to the E1004. GitHub Pages never
+  receives it.
 - CORS permits only `https://elohmeier.github.io`; wildcard origins are not
   used.
 - The API requires an exact 960,000-byte body and does not allocate a second
@@ -82,6 +85,11 @@ The local API uses HTTP. The token protects authorization, but image bytes can
 still be observed by another party on the same Wi-Fi. Supporting trusted HTTPS
 directly on an unprovisioned local device would require a separate certificate
 ownership and trust design.
+
+The device-served page is deliberately only a small HTML shell. It loads the
+fixed `device-uploader.js` and `device-uploader.css` assets from GitHub Pages;
+the classic script executes in the local page's origin, so its API upload is
+same-origin while editor updates can be deployed without reflashing firmware.
 
 ## Browser compatibility
 

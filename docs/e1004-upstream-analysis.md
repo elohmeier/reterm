@@ -108,3 +108,7 @@ The receiver now also exposes the same packed framebuffer over a temporary,
 token-authenticated Wi-Fi API. Button wake, first-run captive provisioning,
 QR session handoff, CORS, deep sleep, and the browser uploader are documented
 in `docs/wifi-upload.md`.
+
+The E1004's three capacitive controls are IQS323 channels. They signal through
+the controller's shared active-low RDY/interrupt line on ESP32-S3 GPIO 3; they
+are not direct GPIO 0 buttons.
