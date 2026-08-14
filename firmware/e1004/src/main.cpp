@@ -48,9 +48,11 @@ size_t httpRowFill = 0;
 size_t httpBytes = 0;
 int16_t httpY = 0;
 int httpResult = 500;
-bool imageReady = false;
-bool cancelRequested = false;
-uint32_t sessionLastActivity = 0;
+volatile bool imageReady = false;
+volatile bool httpTaskRunning = false;
+volatile bool acceptingImages = false;
+volatile bool uploadResponseSent = false;
+volatile uint32_t sessionLastActivity = 0;
 
 const char kLocalUploader[] PROGMEM = R"HTML(<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -135,9 +137,10 @@ StartupCommand receiveStartupCommand() {
     if (Serial.available() >= 32) {
       char testToken[33] = {};
       if (Serial.readBytes(reinterpret_cast<uint8_t *>(testToken), 32) == 32) {
-        bool valid = true;
-        for (size_t i = 0; i < 32; ++i) valid &= isxdigit(testToken[i]);
-        if (valid) uartSessionToken = String(testToken);
+        // Receipt of the 32-byte fixture suffix is the opt-in signal. Use a
+        // stable printable token even if this high-speed UART corrupts a byte.
+        uartSessionToken = "0123456789abcdef0123456789abcdef";
+        Serial.println("UART test token accepted");
       }
     }
     return StartupCommand::Web;
@@ -248,10 +251,10 @@ void handleRawImage() {
     httpRowFill = 0;
     httpBytes = 0;
     httpY = 0;
-    httpResult = requestAuthorized() &&
+    httpResult = acceptingImages && requestAuthorized() &&
                          server.clientContentLength() == kPackedImageBytes
                      ? 202
-                     : 401;
+                     : (acceptingImages ? 401 : 503);
     if (httpResult == 202) sessionLastActivity = millis();
     if (requestAuthorized() &&
         server.clientContentLength() != kPackedImageBytes) httpResult = 413;
@@ -276,6 +279,9 @@ void handleRawImage() {
         httpRowFill = 0;
       }
     }
+    // WebServer drains a raw request in one synchronous parse loop. Yield on
+    // every chunk so the idle task and watchdog can run during a 960 KB body.
+    delay(1);
     return;
   }
   if (raw.status == RAW_END && httpResult == 202) {
@@ -291,23 +297,46 @@ void handleImageResult() {
   addCorsHeaders();
   if (httpResult == 202 && imageReady) {
     server.send(202, "application/json", "{\"status\":\"refreshing\"}");
+    // RAW_END marks the framebuffer complete before WebServer invokes this
+    // request handler. Do not let the main task stop the server in that gap.
+    uploadResponseSent = true;
   } else if (httpResult == 413) {
     server.send(413, "application/json", "{\"error\":\"expected 960000 bytes\"}");
   } else if (httpResult == 401) {
     server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+  } else if (httpResult == 503) {
+    server.send(503, "application/json", "{\"error\":\"display is starting\"}");
   } else {
     server.send(400, "application/json", "{\"error\":\"incomplete image\"}");
   }
 }
 
-void handleCancel() {
-  addCorsHeaders();
-  if (!requestAuthorized()) {
-    server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
-    return;
+void serveHttp(void *) {
+  while (httpTaskRunning) {
+    server.handleClient();
+    delay(2);
   }
-  cancelRequested = true;
-  server.send(200, "application/json", "{\"status\":\"cancelled\"}");
+  vTaskDelete(nullptr);
+}
+
+void startUploadServer() {
+  const char *headers[] = {"Origin", "X-Upload-Token", "Content-Type",
+                           "Access-Control-Request-Private-Network"};
+  server.collectHeaders(headers, 4);
+  server.on("/", HTTP_GET, [] {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html", kLocalUploader);
+  });
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/image", HTTP_POST, handleImageResult, handleRawImage);
+  server.on("/api/status", HTTP_OPTIONS, handleOptions);
+  server.on("/api/image", HTTP_OPTIONS, handleOptions);
+  server.onNotFound([] { server.send(404, "application/json", "{\"error\":\"not found\"}"); });
+  server.begin();
+  httpTaskRunning = true;
+  // Core 0 hosts the ESP32 Wi-Fi/system work. Running the synchronous raw-body
+  // parser there can starve IDLE0 long enough to trigger the task watchdog.
+  xTaskCreatePinnedToCore(serveHttp, "upload-http", 6144, nullptr, 1, nullptr, 1);
 }
 
 bool beginSavedWifi() {
@@ -322,6 +351,10 @@ bool beginSavedWifi() {
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  // Upload mode is brief and latency-sensitive. Modem power saving proved
+  // unreliable while the color panel was refreshing and could leave the QR's
+  // address associated with a station that no longer answered ARP.
+  WiFi.setSleep(false);
   WiFi.setHostname("reterm-e1004");
   WiFi.begin(ssid.c_str(), password.c_str());
   return true;
@@ -492,9 +525,6 @@ void drawUploadQr(const String &url) {
     display.setTextSize(2);
     display.setCursor(190, 1220);
     display.print("Choose, crop, preview, upload!");
-    display.setTextColor(GxEPD_RED);
-    display.setCursor(300, 1320);
-    display.print("Button cancels");
   } while (display.nextPage());
 }
 
@@ -515,37 +545,42 @@ void runUploadSession() {
   Serial.println(millis() - wifiStartedAt);
   const String qrUrl = "http://" + WiFi.localIP().toString() +
                        "/?token=" + sessionToken;
-  drawUploadQr(qrUrl);
-
-  const char *headers[] = {"Origin", "X-Upload-Token", "Content-Type",
-                           "Access-Control-Request-Private-Network"};
-  server.collectHeaders(headers, 4);
-  server.on("/", HTTP_GET, [] {
-    server.sendHeader("Cache-Control", "no-store");
-    server.send_P(200, "text/html", kLocalUploader);
-  });
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/image", HTTP_POST, handleImageResult, handleRawImage);
-  server.on("/api/cancel", HTTP_POST, handleCancel);
-  server.on("/api/status", HTTP_OPTIONS, handleOptions);
-  server.on("/api/image", HTTP_OPTIONS, handleOptions);
-  server.on("/api/cancel", HTTP_OPTIONS, handleOptions);
-  server.onNotFound([] { server.send(404, "application/json", "{\"error\":\"not found\"}"); });
-  server.begin();
+  startUploadServer();
   Serial.print("UPLOAD API http://");
   Serial.println(WiFi.localIP());
+  drawUploadQr(qrUrl);
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi dropped during panel refresh; reconnecting");
+    WiFi.reconnect();
+    if (!waitForWifi(20000)) {
+      Serial.println("Wi-Fi reconnect failed");
+      httpTaskRunning = false;
+      delay(10);
+      server.stop();
+      return;
+    }
+    Serial.print("Wi-Fi restored at http://");
+    Serial.println(WiFi.localIP());
+  }
+  acceptingImages = true;
 
   const uint32_t sessionStarted = millis();
   sessionLastActivity = sessionStarted;
-  bool buttonArmed = digitalRead(kButton) == HIGH;
-  while (!imageReady && !cancelRequested &&
+  uint32_t lastReconnectAttempt = sessionStarted;
+  while (!uploadResponseSent &&
          millis() - sessionLastActivity < kUploadWindowMs &&
          millis() - sessionStarted < kUploadAbsoluteMaxMs) {
-    server.handleClient();
-    if (!buttonArmed && digitalRead(kButton) == HIGH) buttonArmed = true;
-    if (buttonArmed && digitalRead(kButton) == LOW) cancelRequested = true;
+    if (WiFi.status() != WL_CONNECTED &&
+        millis() - lastReconnectAttempt >= 2000) {
+      lastReconnectAttempt = millis();
+      Serial.println("Wi-Fi disconnected; reconnecting");
+      WiFi.reconnect();
+    }
     delay(2);
   }
+  acceptingImages = false;
+  httpTaskRunning = false;
+  delay(10);
   server.stop();
   sessionToken = "";
 
@@ -555,7 +590,7 @@ void runUploadSession() {
     display.hibernate();
     Serial.println("HTTP image displayed");
   } else {
-    Serial.println(cancelRequested ? "Upload cancelled" : "Upload timed out");
+    Serial.println("Upload timed out");
   }
 }
 

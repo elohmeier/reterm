@@ -23,12 +23,17 @@
    upload, refreshes the panel, invalidates the token, disables Wi-Fi, and
    returns to deep sleep.
 
+The HTTP session remains alive until the successful image request's `202`
+response has been sent. Receiving the final framebuffer byte alone does not
+stop the server, avoiding a race that left browsers waiting at 100% upload.
+
 The upload API has a five-minute inactivity timeout after the upload QR has
 finished refreshing. An authenticated heartbeat from the open local uploader
 keeps the session active while the user chooses and edits a photo. An absolute
 30-minute cap prevents an abandoned browser tab from holding Wi-Fi awake
 forever. First-run provisioning remains available for three minutes. Tapping
-a capacitive button during either window cancels it.
+another button does not cancel an active session; it ends only after a
+successful upload or timeout.
 
 The device-hosted editor also performs dithering in a Web Worker. This keeps
 its 15-second heartbeat and UI progress active while an iPhone processes all
@@ -40,6 +45,13 @@ in the QR. This avoids relying on multicast DNS, which is often unreliable on
 guest or client-isolated WLANs. Button wakes bypass the UART recovery grace
 period; that three-second window remains available after reset for host image
 tools.
+The HTTP server starts before the slow color-panel refresh begins. Its task
+runs away from the Wi-Fi/system core and yields between raw request chunks;
+otherwise draining a 960 KB body can starve the ESP32 idle task and trigger a
+watchdog reboot just after browser progress reaches 100%. Image uploads are
+accepted after the QR refresh completes so display writes cannot overlap.
+Upload mode also disables Wi-Fi modem sleep and reconnects the station if panel
+activity disrupts its association.
 The QR renderer only visits modules intersecting the current 40-line display
 page; avoiding repeatedly clipped QR geometry reduced measured time from an
 upload command to physical panel refresh from about 24 seconds to 3.3 seconds.
@@ -48,7 +60,7 @@ upload command to physical panel refresh from about 24 seconds to 3.3 seconds.
 
 The API listens on port 80 of the address encoded in the QR.
 
-### `OPTIONS /api/status`, `/api/image`, or `/api/cancel`
+### `OPTIONS /api/status` or `/api/image`
 
 Successful preflights from the production Pages origin return:
 
@@ -79,17 +91,13 @@ driver: 0 black, 1 white, 2 green, 3 blue, 4 red, and 5 yellow. The first pixel
 is in the high nibble. Values 6 and 7 are not accepted from the browser
 quantizer.
 
-### `POST /api/cancel`
-
-Requires the session token and closes the session without changing the panel.
-
 ## Security properties
 
 - Tokens contain 128 bits from `esp_fill_random()`.
 - Production tokens exist only in RAM, are never written to NVS or UART logs,
   and are compared without data-dependent early exit.
-- A token is valid for one short session and is cleared after upload, cancel,
-  or timeout.
+- A token is valid for one short session and is cleared after upload or
+  timeout.
 - The local uploader's token is sent only to the E1004. GitHub Pages never
   receives it.
 - CORS permits only `https://elohmeier.github.io`; wildcard origins are not
