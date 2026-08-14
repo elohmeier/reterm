@@ -24,6 +24,28 @@ The result is `firmware/bringup/.pio/build/reterminal-e1001/firmware.bin`.
 The E1004 result is `firmware/e1004/.pio/build/reterminal-e1004/firmware.bin`.
 See the analysis notes before attempting to flash it.
 
+## Send an image to the E1004
+
+The image sender supports HEIC, JPEG, PNG, and other Pillow formats. It applies
+EXIF orientation, automatically chooses the best 90-degree orientation,
+center-crops and resizes to 1200x1600, and Floyd-Steinberg dithers into the
+panel's black, white, green, blue, red, and yellow pigments.
+
+```sh
+sh tools/send-image.sh /path/to/photo.heic
+```
+
+The default `--fit cover` fills the screen. Use `--fit contain` to preserve the
+entire image with white letterboxing. After the receiver firmware has been
+installed once, skip rebuilding and reflashing it:
+
+```sh
+sh tools/send-image.sh /path/to/photo.jpg --no-flash
+```
+
+A dithered PNG preview is written to
+`/root/.cache/reterm-e1004-preview.png` before the image is sent.
+
 The initial bring-up image has been built, flashed at factory app0 offset
 `0x90000`, and visually verified on the connected E1001.
 

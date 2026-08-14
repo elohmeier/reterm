@@ -90,3 +90,16 @@ The first boot completed successfully over UART: PSRAM framebuffer allocation
 and dual-controller transfer succeeded, the two halves each received 480,000
 bytes, full refresh completed in 27.81 seconds, and the display then entered
 hibernate.
+
+## Host image protocol
+
+The custom firmware also accepts a full-screen image over its CH341 UART at
+921600 baud. After reset it announces `READY E1004IMG 1200 1600 4BPP`, accepts
+the eight-byte magic `E1IMG001`, then reads 960,000 bytes. Each byte contains
+two 3-bit GxEPD2 palette indices, high nibble first. Rows are copied directly
+into the PSRAM framebuffer before one full refresh.
+
+`tools/send-image.sh` implements the complete host workflow, including HEIC
+decoding, EXIF correction, automatic rotation, cover/contain scaling,
+six-pigment Floyd-Steinberg dithering, receiver build/flash, data transfer, and
+refresh verification.
