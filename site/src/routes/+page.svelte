@@ -180,7 +180,7 @@
         throw new Error(result.error ?? `display returned HTTP ${statusResponse.status}`);
       }
       status = 'Uploading 960 KB to the display…';
-      const response = await fetch(localRequest(`${device}/api/image`, {
+      const response = await fetch(localRequest(`${device}/api/image/${encodeURIComponent(token)}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/octet-stream',

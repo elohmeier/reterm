@@ -227,7 +227,9 @@ void handleOptions() {
 }
 
 bool requestAuthorized() {
-  return originAllowed() && constantTimeToken(server.header("X-Upload-Token"));
+  if (!originAllowed()) return false;
+  if (constantTimeToken(server.header("X-Upload-Token"))) return true;
+  return server.uri() == "/api/image/" + sessionToken;
 }
 
 void handleStatus() {
@@ -320,6 +322,7 @@ void serveHttp(void *) {
 }
 
 void startUploadServer() {
+  const String imagePath = "/api/image/" + sessionToken;
   const char *headers[] = {"Origin", "X-Upload-Token", "Content-Type",
                            "Access-Control-Request-Private-Network"};
   server.collectHeaders(headers, 4);
@@ -329,8 +332,13 @@ void startUploadServer() {
   });
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/image", HTTP_POST, handleImageResult, handleRawImage);
+  // Safari has intermittently omitted the custom header on large XHR bodies.
+  // The token is already present in the QR URL, so an exact per-session path
+  // provides an equivalent same-origin authentication channel.
+  server.on(imagePath, HTTP_POST, handleImageResult, handleRawImage);
   server.on("/api/status", HTTP_OPTIONS, handleOptions);
   server.on("/api/image", HTTP_OPTIONS, handleOptions);
+  server.on(imagePath, HTTP_OPTIONS, handleOptions);
   server.onNotFound([] { server.send(404, "application/json", "{\"error\":\"not found\"}"); });
   server.begin();
   httpTaskRunning = true;

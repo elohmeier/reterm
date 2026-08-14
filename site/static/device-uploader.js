@@ -158,7 +158,7 @@
     try {
       await new Promise((resolve, reject) => {
         const request = new XMLHttpRequest();
-        request.open('POST', '/api/image');
+        request.open('POST', `/api/image/${encodeURIComponent(token)}`);
         request.timeout = 120000;
         request.setRequestHeader('Content-Type', 'application/octet-stream');
         request.setRequestHeader('X-Upload-Token', token);

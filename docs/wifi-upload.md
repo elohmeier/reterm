@@ -78,13 +78,17 @@ Vary: Origin
 Requires `X-Upload-Token`. It reports the model, dimensions, packed length,
 format, and ordered palette.
 
-### `POST /api/image`
+### `POST /api/image/:token`
 
 ```http
 Content-Type: application/octet-stream
-X-Upload-Token: <32 lowercase hexadecimal characters>
 Content-Length: 960000
 ```
+
+The browser includes the session token in the exact per-session upload path.
+The API also continues to accept `POST /api/image` with the token in the
+`X-Upload-Token` header. The path form avoids an iOS Safari failure where the
+custom header could be absent after a large XHR body had been transmitted.
 
 The 4-bit source palette is the GxEPD2 encoding already used by the custom
 driver: 0 black, 1 white, 2 green, 3 blue, 4 red, and 5 yellow. The first pixel
