@@ -1,8 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <GxEPD2_BW.h>
-#include <Fonts/FreeSans12pt7b.h>
-#include <Fonts/FreeSansBold24pt7b.h>
+#include <Fonts/FreeSerifBoldItalic24pt7b.h>
 
 namespace {
 constexpr int kSck = 7;
@@ -39,12 +38,37 @@ void setup() {
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
-    display.drawRect(12, 12, display.width() - 24, display.height() - 24,
-                     GxEPD_BLACK);
-    display.setFont(&FreeSansBold24pt7b);
-    centered("reterm custom firmware", 210);
-    display.setFont(&FreeSans12pt7b);
-    centered("E1001 display bring-up succeeded", 270);
+
+    // A loose double border makes the card feel hand drawn.
+    display.drawRoundRect(16, 16, display.width() - 32,
+                          display.height() - 32, 32, GxEPD_BLACK);
+    display.drawRoundRect(23, 22, display.width() - 46,
+                          display.height() - 44, 28, GxEPD_BLACK);
+
+    // Big, curly-ish italic serif lettering.
+    display.setFont(&FreeSerifBoldItalic24pt7b);
+    display.setTextSize(2);
+    centered("CLEO", 145);
+    display.setTextSize(1);
+
+    // Curls, confetti, and little bubbles around her name.
+    display.drawCircle(105, 112, 24, GxEPD_BLACK);
+    display.drawCircle(105, 112, 13, GxEPD_BLACK);
+    display.drawCircle(694, 112, 24, GxEPD_BLACK);
+    display.drawCircle(694, 112, 13, GxEPD_BLACK);
+    display.fillCircle(70, 72, 7, GxEPD_BLACK);
+    display.fillCircle(730, 72, 7, GxEPD_BLACK);
+    display.fillCircle(150, 174, 5, GxEPD_BLACK);
+    display.fillCircle(650, 174, 5, GxEPD_BLACK);
+
+    // One enormous heart: two round lobes flowing into a pointed base.
+    display.fillCircle(340, 285, 72, GxEPD_BLACK);
+    display.fillCircle(460, 285, 72, GxEPD_BLACK);
+    display.fillTriangle(278, 302, 522, 302, 400, 442, GxEPD_BLACK);
+
+    // White highlights give the solid heart a friendly illustrated look.
+    display.fillCircle(319, 265, 13, GxEPD_WHITE);
+    display.fillCircle(337, 249, 7, GxEPD_WHITE);
   } while (display.nextPage());
 
   display.hibernate();
