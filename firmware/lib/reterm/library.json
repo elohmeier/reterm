@@ -1,0 +1,7 @@
+{
+  "name": "reterm",
+  "version": "1.0.0",
+  "description": "Shared reTerminal E-series upload session, provisioning, and persistence runtime",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

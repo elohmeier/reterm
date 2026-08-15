@@ -1,10 +1,12 @@
-name: Deploy photo uploader to GitHub Pages
+name: Deploy site and firmware to GitHub Pages
 
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
+      - "firmware/**"
+      - "tools/package-web-flash.sh"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -33,6 +35,19 @@ jobs:
         working-directory: site
       - run: npm run build
         working-directory: site
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('firmware/*/platformio.ini') }}
+      - run: pip install platformio
+      - run: pio run -d firmware/e1001
+      - run: pio run -d firmware/e1004
+      # The deploy that publishes the editor also publishes matching firmware,
+      # so the browser flasher can never hand out a stale-protocol build.
+      - run: sh tools/package-web-flash.sh site/build/flash "$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

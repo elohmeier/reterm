@@ -1,6 +1,5 @@
 backups/
-firmware/bringup/.pio/
-firmware/bringup/*.so
+firmware/e1001/.pio/
 firmware/e1004/.pio/
 .venv/
 __pycache__/

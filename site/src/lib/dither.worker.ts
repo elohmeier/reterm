@@ -1,13 +1,17 @@
-// Quantizes an RGBA frame to the six Spectra pigments and packs two 4-bit
-// palette indices per byte (first pixel in the high nibble), matching the
-// firmware's GxEPD2 encoding. Several inking styles share one code path.
-import { PIGMENTS, type InkingId } from './pigments';
+// Quantizes an RGBA frame to the target device's pigments and packs it into
+// the firmware's GxEPD2 wire format: two 4-bit palette indices per byte for
+// color panels (first pixel in the high nibble), or eight 1-bit pixels per
+// byte for monochrome panels (bit set = white, MSB is the leftmost pixel).
+// Several inking styles share one code path.
+import type { InkingId, Packing } from './devices';
 
 type Job = {
   rgba: ArrayBuffer;
   width: number;
   height: number;
   inking: InkingId;
+  palette: [number, number, number][];
+  packing: Packing;
   wantPacked: boolean;
 };
 
@@ -57,11 +61,16 @@ const BAYER8 = [
 ];
 const BAYER_SPREAD = 96;
 
-function nearest(red: number, green: number, blue: number): number {
+function nearest(
+  palette: [number, number, number][],
+  red: number,
+  green: number,
+  blue: number
+): number {
   let selected = 0;
   let best = Number.POSITIVE_INFINITY;
-  for (let index = 0; index < PIGMENTS.length; index += 1) {
-    const [r, g, b] = PIGMENTS[index].rgb;
+  for (let index = 0; index < palette.length; index += 1) {
+    const [r, g, b] = palette[index];
     const dr = red - r;
     const dg = green - g;
     const db = blue - b;
@@ -75,10 +84,10 @@ function nearest(red: number, green: number, blue: number): number {
 }
 
 self.onmessage = (event: MessageEvent<Job>) => {
-  const { rgba, width, height, inking, wantPacked } = event.data;
+  const { rgba, width, height, inking, palette, packing, wantPacked } = event.data;
   const source = new Uint8ClampedArray(rgba);
   const preview = new Uint8ClampedArray(source.length);
-  const packed = new Uint8Array((width * height) / 2);
+  const packed = new Uint8Array(packing === '1bpp' ? (width * height) / 8 : (width * height) / 2);
   const kernel = KERNELS[inking];
 
   // Three rolling error rows with a two-pixel apron so kernels never bounds-check.
@@ -109,15 +118,21 @@ self.onmessage = (event: MessageEvent<Job>) => {
       green = green < 0 ? 0 : green > 255 ? 255 : green;
       blue = blue < 0 ? 0 : blue > 255 ? 255 : blue;
 
-      const selected = nearest(red, green, blue);
-      const [pr, pg, pb] = PIGMENTS[selected].rgb;
+      const selected = nearest(palette, red, green, blue);
+      const [pr, pg, pb] = palette[selected];
       preview[pixel] = pr;
       preview[pixel + 1] = pg;
       preview[pixel + 2] = pb;
       preview[pixel + 3] = 255;
-      const packedIndex = (y * width + x) >> 1;
-      if ((x & 1) === 0) packed[packedIndex] = selected << 4;
-      else packed[packedIndex] |= selected;
+      const linear = y * width + x;
+      if (packing === '1bpp') {
+        // Pigment 1 is white; GxEPD2 monochrome buffers use 1 = white.
+        if (selected === 1) packed[linear >> 3] |= 0x80 >> (x & 7);
+      } else if ((x & 1) === 0) {
+        packed[linear >> 1] = selected << 4;
+      } else {
+        packed[linear >> 1] |= selected;
+      }
 
       if (kernel) {
         const er = red - pr;

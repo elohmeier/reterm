@@ -1,4 +1,5 @@
 import { readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig, type Plugin } from 'vite';
 
@@ -51,7 +52,13 @@ export default defineConfig(({ command }) => ({
   },
   build: {
     outDir: 'build',
-    manifest: true
+    manifest: true,
+    rollupOptions: {
+      input: {
+        index: resolve(import.meta.dirname, 'index.html'),
+        flash: resolve(import.meta.dirname, 'flash.html')
+      }
+    }
   },
   plugins: [svelte(), deviceBoot()]
 }));

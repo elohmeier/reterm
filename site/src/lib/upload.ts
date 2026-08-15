@@ -1,19 +1,32 @@
-// Session handling and the E1004 upload protocol. The request shapes here are
-// load-bearing for iOS Safari and Chromium Local Network Access — change them
-// only together with firmware (see AGENTS.md).
+// Session handling and the device upload protocol. The request shapes here
+// are load-bearing for iOS Safari and Chromium Local Network Access — change
+// them only together with firmware (see AGENTS.md).
 
-// device is '' when the page is served by the E1004 itself; API calls are then
-// same-origin relative requests.
-export type Session = { device: string; token: string };
+// device is '' when the page is served by the frame itself; API calls are
+// then same-origin relative requests. model is the URL's device hint; the
+// authoritative value arrives with /api/status.
+export type Session = { device: string; token: string; model: string };
+
+export type DeviceStatus = {
+  model?: string;
+  width?: number;
+  height?: number;
+  bytes?: number;
+  format?: string;
+  palette?: string[];
+};
 
 export function readSession(): Session | null {
   const params = new URLSearchParams(location.hash.slice(1));
   const device = (params.get('device') ?? '').replace(/\/$/, '');
   const hashToken = params.get('token') ?? '';
-  if (device && hashToken) return { device, token: hashToken };
-  // Device-served page: the firmware's QR puts the token in the query string.
-  const token = new URLSearchParams(location.search).get('token') ?? '';
-  return token ? { device: '', token } : null;
+  if (device && hashToken) {
+    return { device, token: hashToken, model: params.get('model') ?? '' };
+  }
+  // Device-served page: the firmware's QR puts token and model in the query.
+  const query = new URLSearchParams(location.search);
+  const token = query.get('token') ?? '';
+  return token ? { device: '', token, model: query.get('model') ?? '' } : null;
 }
 
 export function describeError(error: unknown): string {
@@ -44,10 +57,16 @@ export function localRequest(url: string, init: RequestInit): Request {
 
 /**
  * Keeps the device's five-minute inactivity window open while the user edits,
- * mirroring the device-hosted uploader. Returns a stop function.
+ * mirroring the device-hosted uploader. Reports the first successful status
+ * body so the app can confirm the device model. Returns a stop function.
  */
-export function startHeartbeat(session: Session, onExpired: () => void): () => void {
+export function startHeartbeat(
+  session: Session,
+  onExpired: () => void,
+  onStatus?: (status: DeviceStatus) => void
+): () => void {
   let stopped = false;
+  let reported = false;
   const beat = async () => {
     try {
       const response = await fetch(
@@ -57,6 +76,13 @@ export function startHeartbeat(session: Session, onExpired: () => void): () => v
         })
       );
       if (response.status === 401 && !stopped) onExpired();
+      if (response.ok && !reported && !stopped && onStatus) {
+        const status = (await response.json().catch(() => null)) as DeviceStatus | null;
+        if (status) {
+          reported = true;
+          onStatus(status);
+        }
+      }
     } catch {
       // Transient reachability problems surface on the upload path instead.
     }
@@ -81,7 +107,13 @@ export async function uploadPacked(
     const result = await statusResponse.json().catch(() => ({}));
     throw new Error(result.error ?? `display returned HTTP ${statusResponse.status}`);
   }
-  stage('Sending 960 KB to the frame…');
+  const status = (await statusResponse.json().catch(() => ({}))) as DeviceStatus;
+  if (typeof status.bytes === 'number' && status.bytes !== packed.byteLength) {
+    throw new Error(
+      `this frame is a ${status.model ?? 'different device'} — reopen its QR link and try again`
+    );
+  }
+  stage(`Sending ${Math.round(packed.byteLength / 1000)} KB to the frame…`);
   const response = await fetch(
     localRequest(`${session.device}/api/image/${encodeURIComponent(session.token)}`, {
       method: 'POST',

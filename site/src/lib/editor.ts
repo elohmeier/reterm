@@ -1,6 +1,6 @@
-// Fabric.js editing surface for the 1200×1600 six-pigment frame. All objects
-// live in panel coordinates; the viewport zoom only fits them on screen, so
-// exporting at panel size needs no reprojection.
+// Fabric.js editing surface for the target frame. All objects live in panel
+// coordinates; the viewport zoom only fits them on screen, so exporting at
+// panel size needs no reprojection.
 import {
   Canvas,
   FabricImage,
@@ -10,7 +10,6 @@ import {
   PencilBrush,
   filters
 } from 'fabric';
-import { SCREEN_HEIGHT, SCREEN_WIDTH } from './pigments';
 import type { StickerDef } from './stickers';
 
 export type LookId = 'none' | 'punch' | 'kodak' | 'polaroid' | 'vintage' | 'mono';
@@ -45,6 +44,8 @@ type PhotoFilters = NonNullable<FabricImage['filters']>;
 
 export class InkStudio {
   readonly canvas: Canvas;
+  readonly width: number;
+  readonly height: number;
   private photo: FabricImage | null = null;
   private look: LookId = 'none';
   private adjust: Adjust = { brightness: 0, contrast: 0, saturation: 0 };
@@ -52,12 +53,15 @@ export class InkStudio {
 
   constructor(
     element: HTMLCanvasElement,
+    size: { width: number; height: number },
     private changed: () => void,
     selection: (state: Selection) => void
   ) {
+    this.width = size.width;
+    this.height = size.height;
     this.canvas = new Canvas(element, {
-      width: SCREEN_WIDTH,
-      height: SCREEN_HEIGHT,
+      width: size.width,
+      height: size.height,
       backgroundColor: '#ffffff',
       preserveObjectStacking: true,
       selection: false
@@ -99,8 +103,8 @@ export class InkStudio {
 
   resize(displayWidth: number) {
     const width = Math.max(120, displayWidth);
-    this.canvas.setDimensions({ width, height: (width * SCREEN_HEIGHT) / SCREEN_WIDTH });
-    this.canvas.setZoom(width / SCREEN_WIDTH);
+    this.canvas.setDimensions({ width, height: (width * this.height) / this.width });
+    this.canvas.setZoom(width / this.width);
     this.canvas.requestRenderAll();
   }
 
@@ -113,8 +117,8 @@ export class InkStudio {
   }
 
   setPhoto(source: ImageBitmap | HTMLImageElement) {
-    // Cap the working resolution: plenty for a 1200×1600 panel and safely
-    // below the WebGL filter texture limit.
+    // Cap the working resolution: plenty for either panel and safely below
+    // the WebGL filter texture limit.
     const maxSide = 3200;
     const scale = Math.min(1, maxSide / Math.max(source.width, source.height));
     const width = Math.round(source.width * scale);
@@ -127,10 +131,10 @@ export class InkStudio {
 
     if (this.photo) this.canvas.remove(this.photo);
     const photo = new FabricImage(buffer, {
-      left: SCREEN_WIDTH / 2,
-      top: SCREEN_HEIGHT / 2
+      left: this.width / 2,
+      top: this.height / 2
     });
-    const target = SCREEN_WIDTH / SCREEN_HEIGHT;
+    const target = this.width / this.height;
     const normalError = Math.abs(Math.log(width / height / target));
     const rotatedError = Math.abs(Math.log(height / width / target));
     if (rotatedError < normalError) photo.angle = 90;
@@ -153,9 +157,9 @@ export class InkStudio {
       Math.abs(photo.width * Math.sin(radians)) + Math.abs(photo.height * Math.cos(radians));
     const factor =
       mode === 'cover'
-        ? Math.max(SCREEN_WIDTH / spanX, SCREEN_HEIGHT / spanY)
-        : Math.min(SCREEN_WIDTH / spanX, SCREEN_HEIGHT / spanY);
-    photo.set({ scaleX: factor, scaleY: factor, left: SCREEN_WIDTH / 2, top: SCREEN_HEIGHT / 2 });
+        ? Math.max(this.width / spanX, this.height / spanY)
+        : Math.min(this.width / spanX, this.height / spanY);
+    photo.set({ scaleX: factor, scaleY: factor, left: this.width / 2, top: this.height / 2 });
     photo.setCoords();
     this.canvas.requestRenderAll();
     this.changed();
@@ -195,10 +199,11 @@ export class InkStudio {
 
   addText(fontFamily: string, fill: string, content = 'Hello!') {
     const text = new IText(content, {
-      left: SCREEN_WIDTH / 2,
-      top: SCREEN_HEIGHT / 2,
+      left: this.width / 2,
+      top: this.height / 2,
       fontFamily,
-      fontSize: 140,
+      // Proportional to the panel: 140px on the 1200×1600 E1004.
+      fontSize: Math.round(Math.min(this.width, this.height) * (140 / 1200)),
       fill,
       textAlign: 'center'
     });
@@ -210,16 +215,18 @@ export class InkStudio {
   }
 
   addSticker(definition: StickerDef) {
+    const scale = (Math.min(this.width, this.height) * 3.4) / 1200;
+    const jitter = Math.min(this.width, this.height) / 7.5;
     const sticker = new Path(definition.path, {
-      left: SCREEN_WIDTH / 2 + (Math.random() - 0.5) * 160,
-      top: SCREEN_HEIGHT / 2 + (Math.random() - 0.5) * 160,
+      left: this.width / 2 + (Math.random() - 0.5) * jitter,
+      top: this.height / 2 + (Math.random() - 0.5) * jitter,
       angle: (Math.random() - 0.5) * 24,
       fill: definition.fill,
       stroke: definition.stroke ?? null,
       strokeWidth: definition.strokeWidth ?? 0,
       opacity: definition.opacity ?? 1,
-      scaleX: 3.4,
-      scaleY: 3.4
+      scaleX: scale,
+      scaleY: scale
     });
     this.canvas.add(sticker);
     this.canvas.setActiveObject(sticker);
@@ -265,15 +272,15 @@ export class InkStudio {
 
   /** Render the composition at exactly panel resolution (controls excluded). */
   exportFrame(): ImageData {
-    const snapshot = this.canvas.toCanvasElement(SCREEN_WIDTH / this.canvas.getWidth());
+    const snapshot = this.canvas.toCanvasElement(this.width / this.canvas.getWidth());
     const out = document.createElement('canvas');
-    out.width = SCREEN_WIDTH;
-    out.height = SCREEN_HEIGHT;
+    out.width = this.width;
+    out.height = this.height;
     const context = out.getContext('2d', { alpha: false, willReadFrequently: true })!;
     context.fillStyle = '#ffffff';
-    context.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-    context.drawImage(snapshot, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-    return context.getImageData(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    context.fillRect(0, 0, this.width, this.height);
+    context.drawImage(snapshot, 0, 0, this.width, this.height);
+    return context.getImageData(0, 0, this.width, this.height);
   }
 
   dispose() {

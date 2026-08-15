@@ -6,8 +6,8 @@
   import '@fontsource/caveat/700.css';
   import '@fontsource/special-elite';
   import { InkStudio, LOOKS, type LookId } from '$lib/editor';
-  import { INKINGS, PIGMENTS, SCREEN_HEIGHT, SCREEN_WIDTH, type InkingId } from '$lib/pigments';
-  import { STICKERS } from '$lib/stickers';
+  import { INKINGS, resolveDevice, type InkingId } from '$lib/devices';
+  import { stickersFor } from '$lib/stickers';
   // Inlined so the worker also starts when the bundle is served cross-origin
   // from GitHub Pages into the device-hosted page.
   import DitherWorker from '$lib/dither.worker?worker&inline';
@@ -25,6 +25,11 @@
     { family: 'Special Elite', label: 'Typed' }
   ];
 
+  // The target frame: from the QR's model hint (query or hash), E1004 by
+  // default. /api/status confirms it once a session connects.
+  const profile = resolveDevice();
+  const STICKERS = stickersFor(profile);
+
   let stageEl: HTMLCanvasElement;
   let proofEl: HTMLCanvasElement;
   let mountEl: HTMLDivElement;
@@ -37,7 +42,7 @@
   let sending = $state(false);
   let view = $state<'photo' | 'ink'>('photo');
   let tool = $state<'move' | 'text' | 'stickers' | 'draw'>('move');
-  let ink = $state<string>(PIGMENTS[0].hex);
+  let ink = $state<string>(profile.pigments[0].hex);
   let brushWidth = $state(16);
   let inking = $state<InkingId>('floyd');
   let look = $state<LookId>('none');
@@ -67,10 +72,26 @@
     stopHeartbeat?.();
     session = next;
     setStatus('ok', 'Frame connected — take your time, the session stays open while you edit.');
-    stopHeartbeat = startHeartbeat(next, () => {
-      session = null;
-      setStatus('error', 'The session ended. Press any button on the frame for a fresh QR.');
-    });
+    stopHeartbeat = startHeartbeat(
+      next,
+      () => {
+        session = null;
+        setStatus('error', 'The session ended. Press any button on the frame for a fresh QR.');
+      },
+      (status) => {
+        // The frame's own status is authoritative; a mismatched editor would
+        // dither for the wrong panel and be rejected on upload anyway.
+        if (status.model && status.model !== profile.id) {
+          stopHeartbeat?.();
+          stopHeartbeat = null;
+          session = null;
+          setStatus(
+            'error',
+            `This frame is a ${status.model}, but the editor is set up for the ${profile.id}. Rescan the QR on the frame.`
+          );
+        }
+      }
+    );
   }
 
   onMount(() => {
@@ -78,11 +99,11 @@
     if (!session) {
       setStatus(
         'idle',
-        'No frame linked — press a button on your E1004 and scan its QR. Designing works without one.'
+        `No frame linked — press a button on your ${profile.short} and scan its QR. Designing works without one.`
       );
     }
 
-    const instance = new InkStudio(stageEl, markDirty, (state) => (selected = state));
+    const instance = new InkStudio(stageEl, profile, markDirty, (state) => (selected = state));
     instance.mountProofLayer(proofEl);
     proofEl.classList.add('proof');
     studio = instance;
@@ -124,7 +145,7 @@
     clearTimeout(proofTimer);
     if (view !== 'ink') return;
     if (!studio || studio.isEmpty()) {
-      proofEl?.getContext('2d')?.clearRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+      proofEl?.getContext('2d')?.clearRect(0, 0, profile.width, profile.height);
       return;
     }
     proofTimer = setTimeout(() => void runProof(), delay);
@@ -154,7 +175,7 @@
           return;
         }
         const preview = new Uint8ClampedArray(event.data.preview);
-        proofEl.getContext('2d')!.putImageData(new ImageData(preview, SCREEN_WIDTH, SCREEN_HEIGHT), 0, 0);
+        proofEl.getContext('2d')!.putImageData(new ImageData(preview, profile.width, profile.height), 0, 0);
         proofPacked = new Uint8Array(event.data.packed);
         proofState = 'fresh';
         finish(proofPacked);
@@ -164,7 +185,15 @@
         finish(null);
       };
       job.postMessage(
-        { rgba: image.data.buffer, width: SCREEN_WIDTH, height: SCREEN_HEIGHT, inking, wantPacked: true },
+        {
+          rgba: image.data.buffer,
+          width: profile.width,
+          height: profile.height,
+          inking,
+          palette: profile.pigments.map((pigment) => pigment.rgb),
+          packing: profile.packing,
+          wantPacked: true
+        },
         [image.data.buffer]
       );
     });
@@ -276,6 +305,9 @@
     busy = true;
     studio.deselect();
     setView('ink');
+    // setView just scheduled a deferred proof; cancel it so it cannot cancel
+    // the proof this send is about to run itself.
+    clearTimeout(proofTimer);
     try {
       setStatus('busy', 'Pressing the inks…');
       const packed = proofPacked ?? (await runProof());
@@ -308,7 +340,7 @@
 </script>
 
 <svelte:head>
-  <title>Photo Magic · reTerminal E1004</title>
+  <title>Photo Magic · reTerminal {profile.short}</title>
 </svelte:head>
 
 <svelte:window onkeydown={onKeydown} onhashchange={adoptSession} />
@@ -316,11 +348,11 @@
 <main>
   <header class="masthead">
     <div>
-      <p class="eyebrow">reTerminal E1004 · six-ink photo lab</p>
+      <p class="eyebrow">reTerminal {profile.short} · {profile.tagline}</p>
       <h1>Photo Magic</h1>
     </div>
     <ul class="inkstrip" aria-hidden="true">
-      {#each PIGMENTS as pigment (pigment.hex)}
+      {#each profile.pigments as pigment (pigment.hex)}
         <li style:background={pigment.hex}></li>
       {/each}
     </ul>
@@ -333,9 +365,13 @@
   <div class="studio">
     <section class="bench">
       <div class="frame" class:inked={view === 'ink'}>
-        <div class="panel-mount" bind:this={mountEl}>
+        <div
+          class="panel-mount"
+          style:aspect-ratio={`${profile.width} / ${profile.height}`}
+          bind:this={mountEl}
+        >
           <canvas bind:this={stageEl}></canvas>
-          <canvas bind:this={proofEl} width={SCREEN_WIDTH} height={SCREEN_HEIGHT}></canvas>
+          <canvas bind:this={proofEl} width={profile.width} height={profile.height}></canvas>
           {#if !hasContent}
             <div class="hint">
               <p>Add a photo —<br />or start with stickers, ink, and a note.</p>
@@ -350,7 +386,7 @@
             Ink proof{#if proofState === 'cooking'}<span class="cooking" aria-hidden="true">…</span>{/if}
           </button>
         </div>
-        <span class="specs">1200 × 1600 · 6 inks</span>
+        <span class="specs">{profile.width} × {profile.height} · {profile.pigments.length} inks</span>
       </div>
       {#if hasPhoto}
         <div class="caption">
@@ -457,7 +493,7 @@
 
       <div class="wells">
         <span class="wells-label">{selected.recolorable ? 'Repaint with' : 'Ink'}</span>
-        {#each PIGMENTS as pigment (pigment.hex)}
+        {#each profile.pigments as pigment (pigment.hex)}
           <button
             class="well"
             class:current={ink === pigment.hex}
@@ -503,10 +539,12 @@
           Contrast
           <input type="range" min="-0.35" max="0.35" step="0.01" bind:value={contrast} />
         </label>
-        <label class="slider">
-          Color
-          <input type="range" min="-0.9" max="0.9" step="0.01" bind:value={saturation} />
-        </label>
+        {#if profile.color}
+          <label class="slider">
+            Color
+            <input type="range" min="-0.9" max="0.9" step="0.01" bind:value={saturation} />
+          </label>
+        {/if}
       </fieldset>
 
       <div class="sendbar">
@@ -515,7 +553,7 @@
         </button>
         <p class="sendnote">
           {#if session}
-            960 KB over your Wi-Fi · the panel refresh takes about 30 seconds.
+            {Math.round(profile.packedBytes / 1000)} KB over your Wi-Fi · {profile.refreshNote}.
           {:else}
             Press a button on the frame and scan its QR to go live.
           {/if}
@@ -676,7 +714,6 @@
     border-radius: 8px;
     overflow: hidden;
     outline: 1.5px solid #d9d5c9;
-    aspect-ratio: 3 / 4;
   }
   .hint {
     position: absolute;

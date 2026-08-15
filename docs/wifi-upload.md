@@ -1,4 +1,11 @@
-# E1004 wireless photo upload
+# Wireless photo upload
+
+This flow is implemented once in `firmware/lib/reterm` and shared by the
+E1001 and E1004; the sections below describe it in E1004 terms. Differences
+on the E1001: the wake control is the green front button (GPIO3), the
+framebuffer is 800x480 at 1 bit per pixel (48,000 bytes, bit set = white),
+`/api/status` reports `reterminal-e1001` with a black/white palette, and the
+QR URL's `model` parameter makes the editor dither for that panel.
 
 ## User flow
 

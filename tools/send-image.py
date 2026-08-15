@@ -4,7 +4,7 @@
 # dependencies = ["pillow>=11", "pillow-heif>=0.22", "pyserial>=3.5"]
 # ///
 
-"""Prepare, dither, and send a full-screen image to a reTerminal E1004."""
+"""Prepare, dither, and send a full-screen image to a reTerminal E1001 or E1004."""
 
 from __future__ import annotations
 
@@ -21,8 +21,6 @@ import serial
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 
-WIDTH = 1200
-HEIGHT = 1600
 BAUD = 921600
 MAGIC = b"E1IMG001"
 WEB_MAGIC = b"E1WEB001"
@@ -31,9 +29,31 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_PROFILE = REPO / "profiles" / "e1004-IMG_5327" / "profile.json"
 DEFAULT_TONE_GAMMA = 1.0
 
+# Per-device geometry and wire format. "4bpp" packs two palette indices per
+# byte (first pixel in the high nibble); "1bpp" packs eight pixels per byte
+# (bit set = white, MSB is the leftmost pixel).
+DEVICES = {
+    "e1004": {
+        "ready": "READY E1004",
+        "width": 1200,
+        "height": 1600,
+        "packing": "4bpp",
+        "project": "firmware/e1004",
+        "firmware": "firmware/e1004/.pio/build/reterminal-e1004/firmware.bin",
+    },
+    "e1001": {
+        "ready": "READY E1001",
+        "width": 800,
+        "height": 480,
+        "packing": "1bpp",
+        "project": "firmware/e1001",
+        "firmware": "firmware/e1001/.pio/build/reterminal-e1001/firmware.bin",
+    },
+}
+
 # Nominal colors remain useful for index-exact calibration assets. Ordinary
-# photos use the measured profile selected in main(). Order is the 3-bit
-# GxEPD2 encoding consumed by the custom panel driver.
+# photos use the measured profile selected in main(). Order is the GxEPD2
+# palette encoding consumed by the custom panel driver.
 NOMINAL_COLORS = [
     (0, 0, 0),        # black
     (255, 255, 255),  # white
@@ -43,9 +63,11 @@ NOMINAL_COLORS = [
     (245, 205, 30),   # yellow
 ]
 
+BW_COLORS = [(0, 0, 0), (255, 255, 255)]
 
-def orientation_error(size: tuple[int, int]) -> float:
-    return abs(math.log((size[0] / size[1]) / (WIDTH / HEIGHT)))
+
+def orientation_error(size: tuple[int, int], width: int, height: int) -> float:
+    return abs(math.log((size[0] / size[1]) / (width / height)))
 
 
 def load_profile_colors(path: Path) -> list[tuple[int, int, int]]:
@@ -84,23 +106,27 @@ def prepare(
     fit: str,
     colors: list[tuple[int, int, int]],
     tone_gamma: float,
+    width: int,
+    height: int,
+    packing: str,
 ) -> tuple[bytes, Image.Image, bool]:
     register_heif_opener()
     with Image.open(path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGB")
 
-    rotated = orientation_error((image.height, image.width)) < orientation_error(image.size)
+    rotated = (orientation_error((image.height, image.width), width, height)
+               < orientation_error(image.size, width, height))
     if rotated:
         image = image.transpose(Image.Transpose.ROTATE_90)
 
     method = ImageOps.fit if fit == "cover" else ImageOps.contain
     if fit == "cover":
-        image = method(image, (WIDTH, HEIGHT), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        image = method(image, (width, height), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
     else:
-        contained = method(image, (WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-        image = Image.new("RGB", (WIDTH, HEIGHT), "white")
-        image.paste(contained, ((WIDTH - contained.width) // 2,
-                                (HEIGHT - contained.height) // 2))
+        contained = method(image, (width, height), Image.Resampling.LANCZOS)
+        image = Image.new("RGB", (width, height), "white")
+        image.paste(contained, ((width - contained.width) // 2,
+                                (height - contained.height) // 2))
 
     # Spectra photos tend to read darker than their on-screen source. Lift
     # shadows and midtones without moving black or white; values above one
@@ -124,9 +150,15 @@ def prepare(
     if pixels != quantized:
         indexed = Image.frombytes("P", indexed.size, pixels)
         indexed.putpalette(full_palette)
-    packed = bytearray(WIDTH * HEIGHT // 2)
-    for pos in range(0, len(pixels), 2):
-        packed[pos // 2] = (pixels[pos] << 4) | pixels[pos + 1]
+    if packing == "1bpp":
+        packed = bytearray(width * height // 8)
+        for pos, value in enumerate(pixels):
+            if value == 1:  # palette index 1 is white; GxEPD2 uses 1 = white
+                packed[pos // 8] |= 0x80 >> (pos & 7)
+    else:
+        packed = bytearray(width * height // 2)
+        for pos in range(0, len(pixels), 2):
+            packed[pos // 2] = (pixels[pos] << 4) | pixels[pos + 1]
     return bytes(packed), indexed.convert("RGB"), rotated
 
 
@@ -134,9 +166,9 @@ def run(command: list[str]) -> None:
     subprocess.run(command, cwd=REPO, check=True)
 
 
-def wait_for_ready(port: str) -> serial.Serial:
+def wait_for_ready(port: str, ready_prefix: str) -> serial.Serial:
     # First boot of persistence-enabled firmware may format the factory's
-    # previously unused 6 MiB SPIFFS partition before announcing READY.
+    # previously unused SPIFFS partition before announcing READY.
     deadline = time.monotonic() + 120
     device = serial.Serial(port, BAUD, timeout=0.25, write_timeout=10)
     # CH341 DTR/RTS wiring: pulse reset so --no-flash starts a fresh receiver.
@@ -152,14 +184,19 @@ def wait_for_ready(port: str) -> serial.Serial:
             except UnicodeDecodeError:
                 continue  # ROM boot output uses a different baud rate.
             print(f"device: {text}")
-            if text.startswith("READY E1004"):
+            if text.startswith(ready_prefix):
                 return device
+            if text.startswith("READY E1"):
+                device.close()
+                raise RuntimeError(
+                    f"connected device announced {text.split()[1]}; "
+                    "pass the matching --device")
     device.close()
     raise RuntimeError("device did not announce image receiver")
 
 
-def send_uart(port: str, packed: bytes) -> None:
-    device = wait_for_ready(port)
+def send_uart(port: str, packed: bytes, ready_prefix: str) -> None:
+    device = wait_for_ready(port, ready_prefix)
     try:
         device.write(MAGIC)
         for offset in range(0, len(packed), 16384):
@@ -192,9 +229,9 @@ def device_line(device: serial.Serial) -> str | None:
     return text
 
 
-def send_http(port: str, packed: bytes) -> None:
+def send_http(port: str, packed: bytes, ready_prefix: str) -> None:
     """Start a deterministic test session and upload over checksummed TCP."""
-    device = wait_for_ready(port)
+    device = wait_for_ready(port, ready_prefix)
     try:
         handshake = WEB_MAGIC + TEST_TOKEN.encode("ascii")
         if device.write(handshake) != len(handshake):
@@ -246,6 +283,8 @@ def send_http(port: str, packed: bytes) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
+    parser.add_argument("--device", choices=sorted(DEVICES), default="e1004",
+                        help="target frame model (default: %(default)s)")
     parser.add_argument("--port", default="/dev/ttyUSB0")
     parser.add_argument("--fit", choices=("cover", "contain"), default="cover")
     parser.add_argument("--transport", choices=("uart", "http"), default="uart",
@@ -257,7 +296,8 @@ def main() -> int:
     parser.add_argument("--tone-gamma", type=float, default=DEFAULT_TONE_GAMMA,
                         help="photo tone lift; 1 disables it (default: %(default)s)")
     parser.add_argument("--preview", type=Path,
-                        default=Path("/root/.cache/reterm-e1004-preview.png"))
+                        help="dithered preview path "
+                             "(default: /root/.cache/reterm-<device>-preview.png)")
     parser.add_argument("--no-flash", action="store_true",
                         help="reuse image-receiver firmware already on the device")
     parser.add_argument("--prepare-only", action="store_true",
@@ -266,16 +306,29 @@ def main() -> int:
 
     if args.tone_gamma <= 0:
         parser.error("--tone-gamma must be greater than zero")
-    colors = NOMINAL_COLORS if args.nominal_palette else load_profile_colors(args.profile)
-    tone_gamma = 1.0 if args.nominal_palette else args.tone_gamma
-    packed, preview, rotated = prepare(args.image, args.fit, colors, tone_gamma)
-    args.preview.parent.mkdir(parents=True, exist_ok=True)
-    preview.save(args.preview)
-    print(f"prepared {args.image}: 1200x1600, fit={args.fit}, "
-          f"auto-rotated={'yes' if rotated else 'no'}")
-    print(f"dithered preview: {args.preview}")
-    print("color matching: " +
-          ("nominal/index-exact" if args.nominal_palette else str(args.profile)))
+    device = DEVICES[args.device]
+    if args.device == "e1001":
+        # The measured pigment profiles are E1004-specific; the monochrome
+        # panel dithers against plain black and white.
+        colors = BW_COLORS
+        color_matching = "black/white"
+        tone_gamma = args.tone_gamma
+    else:
+        colors = NOMINAL_COLORS if args.nominal_palette else load_profile_colors(args.profile)
+        color_matching = ("nominal/index-exact" if args.nominal_palette
+                          else str(args.profile))
+        tone_gamma = 1.0 if args.nominal_palette else args.tone_gamma
+    preview_path = args.preview or Path(
+        f"/root/.cache/reterm-{args.device}-preview.png")
+    packed, preview, rotated = prepare(
+        args.image, args.fit, colors, tone_gamma,
+        device["width"], device["height"], device["packing"])
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview.save(preview_path)
+    print(f"prepared {args.image}: {device['width']}x{device['height']}, "
+          f"fit={args.fit}, auto-rotated={'yes' if rotated else 'no'}")
+    print(f"dithered preview: {preview_path}")
+    print(f"color matching: {color_matching}")
     print(f"photo tone gamma: {tone_gamma:.2f}" +
           (" (disabled for index-exact asset)" if args.nominal_palette else ""))
 
@@ -283,14 +336,14 @@ def main() -> int:
         return 0
 
     if not args.no_flash:
-        run(["sh", "tools/build-container.sh", "firmware/e1004"])
+        run(["sh", "tools/build-container.sh", device["project"]])
         run(["uvx", "--from", "esptool", "esptool", "--chip", "esp32s3",
              "--port", args.port, "--baud", "460800", "write-flash", "0x90000",
-             "firmware/e1004/.pio/build/reterminal-e1004/firmware.bin"])
+             device["firmware"]])
     if args.transport == "http":
-        send_http(args.port, packed)
+        send_http(args.port, packed, device["ready"])
     else:
-        send_uart(args.port, packed)
+        send_uart(args.port, packed, device["ready"])
     return 0
 
 

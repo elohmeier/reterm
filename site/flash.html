@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ece9e0" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      name="description"
+      content="Flash the reTerminal photo-frame firmware onto an E1001 or E1004 straight from the browser over USB."
+    />
+    <title>Firmware flasher · reTerminal</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        --paper: #ece9e0;
+        --card: #ffffff;
+        --ink: #131313;
+        --muted: #6e6a5e;
+        --red: #d21e28;
+        --blue: #004bbe;
+        --yellow: #f5cd1e;
+        --line: 2px solid var(--ink);
+      }
+      body {
+        margin: 0;
+        color: var(--ink);
+        background:
+          radial-gradient(rgba(19, 19, 19, 0.06) 1px, transparent 1.2px) 0 0 / 14px 14px,
+          var(--paper);
+        font-family: Archivo, 'Avenir Next', system-ui, sans-serif;
+      }
+      main {
+        width: min(680px, 100% - 28px);
+        margin: 0 auto;
+        padding: 26px 0 56px;
+      }
+      .eyebrow {
+        margin: 0 0 7px;
+        font-size: 0.82rem;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        font-family: ui-monospace, monospace;
+      }
+      h1 {
+        margin: 0 0 18px;
+        font-size: clamp(2rem, 6vw, 3rem);
+        line-height: 0.95;
+        letter-spacing: -0.02em;
+        text-shadow:
+          2px 2px 0 rgba(210, 30, 40, 0.55),
+          -2px -2px 0 rgba(0, 75, 190, 0.45);
+      }
+      .card {
+        border: var(--line);
+        border-radius: 16px;
+        background: var(--card);
+        padding: 16px 18px;
+        margin: 0 0 16px;
+      }
+      .card h2 {
+        margin: 0 0 10px;
+        font-size: 1.05rem;
+      }
+      .devices {
+        display: grid;
+        gap: 10px;
+      }
+      @media (min-width: 520px) {
+        .devices {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+      .device {
+        display: block;
+        border: var(--line);
+        border-radius: 13px;
+        padding: 12px 14px;
+        cursor: pointer;
+      }
+      .device:has(input:checked) {
+        background: var(--yellow);
+        box-shadow: 3px 3px 0 var(--ink);
+      }
+      .device input {
+        margin-right: 8px;
+      }
+      .device strong {
+        display: block;
+        margin-bottom: 2px;
+      }
+      .device small {
+        color: var(--muted);
+      }
+      .device:has(input:checked) small {
+        color: inherit;
+      }
+      .flashrow {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin-top: 16px;
+      }
+      esp-web-install-button button.flash {
+        padding: 13px 22px;
+        border: var(--line);
+        border-radius: 12px;
+        background: var(--red);
+        color: #fff;
+        font: inherit;
+        font-weight: 800;
+        font-size: 1rem;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        box-shadow: 4px 4px 0 var(--ink);
+      }
+      esp-web-install-button button.flash:active {
+        translate: 2px 2px;
+        box-shadow: 2px 2px 0 var(--ink);
+      }
+      .warn {
+        border-color: var(--red);
+        box-shadow: 3px 3px 0 var(--red);
+      }
+      p,
+      li {
+        line-height: 1.5;
+      }
+      ul {
+        margin: 8px 0 0;
+        padding-left: 20px;
+      }
+      a {
+        color: var(--blue);
+      }
+      .unsupported {
+        color: var(--red);
+        font-weight: 600;
+      }
+      footer {
+        margin-top: 22px;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">reTerminal photo frames · browser flasher</p>
+      <h1>Firmware flasher</h1>
+
+      <section class="card">
+        <h2>1 · Pick your frame</h2>
+        <div class="devices">
+          <label class="device">
+            <input type="radio" name="device" value="reterminal-e1001" />
+            <strong>reTerminal E1001</strong>
+            <small>7.5″ · 800 × 480 · black &amp; white</small>
+          </label>
+          <label class="device">
+            <input type="radio" name="device" value="reterminal-e1004" checked />
+            <strong>reTerminal E1004</strong>
+            <small>13.3″ · 1200 × 1600 · six colors</small>
+          </label>
+        </div>
+      </section>
+
+      <section class="card warn">
+        <h2>Before you flash</h2>
+        <p>
+          Flashing replaces the firmware on the device, including Seeed's factory firmware. If you
+          may ever want to go back, make a full flash backup first, e.g.
+          <code>esptool --chip esp32s3 read-flash 0 ALL backup.bin</code>. Seeed publishes its stock
+          TRMNL firmware and web flasher on its
+          <a href="https://github.com/Seeed-Projects/OSHW-reTerminal-Series-E-D" rel="noreferrer"
+            >Firmware Hub</a
+          >.
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>2 · Connect and install</h2>
+        <ul>
+          <li>Use Chrome or Edge on a desktop — iOS and most mobile browsers cannot flash.</li>
+          <li>Turn the rear power switch on and connect the frame over USB-C.</li>
+          <li>
+            The frame shows up as a serial port (CH341 USB bridge — on Linux typically
+            <code>ttyUSB0</code>).
+          </li>
+        </ul>
+        <div class="flashrow">
+          <esp-web-install-button id="install" manifest="flash/reterminal-e1004/manifest.json">
+            <button slot="activate" class="flash">Connect &amp; install</button>
+            <span slot="unsupported" class="unsupported">
+              This browser cannot flash over USB — use Chrome or Edge on a desktop.
+            </span>
+            <span slot="not-allowed" class="unsupported">
+              Serial access was blocked. Reload and allow the serial-port permission.
+            </span>
+          </esp-web-install-button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>3 · First start</h2>
+        <p>
+          After flashing, press the green button (E1001) or tap a touch control (E1004): the frame
+          shows a Wi-Fi setup QR on first use, then a one-time QR that opens the
+          <a href="./">Photo Magic editor</a> for wireless uploads.
+        </p>
+      </section>
+
+      <footer>
+        Firmware built from
+        <a href="https://github.com/elohmeier/reterm" rel="noreferrer">elohmeier/reterm</a> by the
+        Pages deploy that serves this page, so flasher and editor always match.
+      </footer>
+    </main>
+    <script type="module" src="/src/flash.ts"></script>
+  </body>
+</html>
