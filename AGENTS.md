@@ -2,15 +2,20 @@
 
 ## Device-hosted web assets
 
-- The E1004 serves an HTML shell but loads `device-uploader.js` and
-  `device-uploader.css` from GitHub Pages. GitHub Pages may cache these assets
-  for ten minutes, including in iOS Safari after a tab is closed.
-- Whenever either asset changes in a way that accompanies firmware behavior or
-  an HTTP API/protocol change, increment the `?v=` cache-busting value for both
-  asset URLs in `firmware/e1004/src/main.cpp`.
-- Preserve or deliberately update the inline compatibility shim in the device
-  HTML shell when changing uploader endpoints; it protects iOS clients that
-  execute an older cached Pages script.
+- The E1004 serves an HTML shell that loads the stable `device-boot.js` from
+  GitHub Pages. That loader is regenerated on every site build (see
+  `site/vite.config.ts`) and injects the current hashed editor bundle, which
+  runs in the device page's origin so uploads stay same-origin on iOS Safari.
+  GitHub Pages may cache `device-boot.js` for ten minutes, including in iOS
+  Safari after a tab is closed; each deploy replaces the hashed chunks, so a
+  stale cached loader can 404 for up to ten minutes after a deploy.
+- Deploy the site to Pages before flashing firmware that references a new
+  `?v=` value, and increment the `?v=` on the `device-boot.js` URL in
+  `firmware/e1004/src/main.cpp` whenever shell or protocol behavior changes
+  together with firmware.
+- The legacy `device-uploader.js`/`device-uploader.css` classic app and the
+  inline XHR compatibility shim were removed with the `?v=4` shell; firmware
+  older than that must be reflashed, since its Pages assets no longer exist.
 - Preserve the initial-page token handshake and same-client fallback unless a
   replacement has been tested on iOS Safari with stale external assets.
 - Build and test both firmware and site for paired protocol changes. Do not

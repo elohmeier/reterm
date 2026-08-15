@@ -63,24 +63,18 @@ volatile bool acceptingImages = false;
 volatile bool uploadResponseSent = false;
 volatile uint32_t sessionLastActivity = 0;
 
+// The shell only mounts the Pages-hosted editor. device-boot.js is a stable,
+// unhashed loader regenerated on every site deploy; it injects the current
+// hashed bundle, which then runs in this page's origin so the upload stays
+// same-origin on iOS Safari. The token stays in the query string, where the
+// editor reads it itself; no-referrer keeps it out of Pages request headers.
 const char kLocalUploader[] PROGMEM = R"HTML(<!doctype html>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>reTerminal Photo Magic</title>
-<link rel="stylesheet" href="https://elohmeier.github.io/reterm/device-uploader.css?v=3">
-<div id="reterm-uploader">Loading photo editor…</div>
-<script>
-window.RETERM_TOKEN=new URLSearchParams(location.search).get('token')||'';
-// Keep cached pre-v2 uploader scripts compatible. Some iOS Safari versions
-// reuse them despite a new QR navigation and omit their custom token header.
-const retermOpen=XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open=function(method,url,...rest){
-  if(method==='POST'&&url==='/api/image')
-    url='/api/image/'+encodeURIComponent(window.RETERM_TOKEN);
-  return retermOpen.call(this,method,url,...rest);
-};
-</script>
-<script defer src="https://elohmeier.github.io/reterm/device-uploader.js?v=3"></script>)HTML";
+<div id="app" style="font-family:sans-serif;padding:24px">Loading the photo editor&hellip;</div>
+<script src="https://elohmeier.github.io/reterm/device-boot.js?v=4"
+onerror="document.getElementById('app').textContent='Could not fetch the editor from the internet. Give this phone internet access, then reload.'"></script>)HTML";
 
 void abortPendingImage() {
   if (pendingImage) pendingImage.close();

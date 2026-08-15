@@ -8,22 +8,27 @@
    credentials are stored only in the ESP32 `wificaptive` NVS namespace.
 3. Once connected to the home Wi-Fi, the E1004 generates a random 128-bit
    session token and displays a second QR.
-4. The QR opens a compact uploader served directly by the E1004. This keeps
-   the upload same-origin on iOS Safari, which blocks an HTTPS GitHub Pages
-   page from posting to a local plain-HTTP device. The full GitHub Pages editor
-   remains available at `https://elohmeier.github.io/reterm/` for compatible
-   browsers. That editor composes the photo with stickers, editable text, and
-   free-hand drawing on a fabric.js canvas, applies optional photo looks, and
-   offers five dithering styles with a live six-ink proof. It sends the same
-   authenticated 15-second `/api/status` heartbeat as the local uploader so
-   long editing sessions do not hit the inactivity timeout, and it adopts a
-   fresh `#device`/`token` hash without a reload if a new QR is scanned into
-   an already-open tab.
+4. The QR opens the photo editor through the E1004: the device serves a small
+   HTML shell whose stable `device-boot.js` loader fetches the current editor
+   bundle from GitHub Pages and executes it in the device page's origin. This
+   keeps the upload same-origin on iOS Safari, which blocks an HTTPS GitHub
+   Pages page from posting to a local plain-HTTP device, while editor updates
+   still deploy without reflashing firmware. The identical app is served
+   directly at `https://elohmeier.github.io/reterm/` for browsers that support
+   cross-origin local-network uploads; there it reads `#device`/`token` hash
+   parameters instead of the device page's `?token=` query and adopts a fresh
+   hash without a reload if a new QR is scanned into an already-open tab.
+   The editor composes the photo with stickers, editable text, and free-hand
+   drawing on a fabric.js canvas, applies optional photo looks, and offers
+   five dithering styles with a live six-ink proof. It sends an authenticated
+   15-second `/api/status` heartbeat so long editing sessions do not hit the
+   inactivity timeout.
 5. The user chooses a JPEG, PNG, WebP, HEIC, or other browser-decodable image,
-   then adjusts rotation, fill/contain mode, zoom, and position.
-6. A Web Worker resizes the image to 1200x1600, applies Floyd-Steinberg
-   dithering to black, white, green, blue, red, and yellow, and packs two
-   pixels into each byte.
+   then places it by direct manipulation, optionally adding overlays drawn
+   only with the six panel pigments.
+6. A Web Worker renders the composition at 1200x1600, applies the selected
+   dithering style against the calibrated black, white, green, blue, red, and
+   yellow pigments, and packs two pixels into each byte.
 7. The browser sends the 960,000-byte framebuffer to the E1004. The firmware
    copies each completed 600-byte row directly into PSRAM while persisting the
    packed framebuffer in SPIFFS, acknowledges the upload, refreshes the panel,
@@ -146,15 +151,18 @@ directly on an unprovisioned local device would require a separate certificate
 ownership and trust design.
 
 The device-served page is deliberately only a small HTML shell. It loads the
-fixed `device-uploader.js` and `device-uploader.css` assets from GitHub Pages;
-the classic script executes in the local page's origin, so its API upload is
-same-origin while editor updates can be deployed without reflashing firmware.
-Asset URLs carry a protocol-version query so Safari does not reuse an older
-ten-minute GitHub Pages cache entry after firmware and uploader changes.
-The shell also rewrites the legacy `/api/image` XHR target to the current
-tokenized path, protecting active devices from older uploader JavaScript that
-iOS may retain despite cache busting. Uploads started during the QR refresh
-wait for the display bus instead of failing with a transient `503`.
+stable `device-boot.js` loader from GitHub Pages, which is regenerated on
+every site build and injects the current content-hashed editor bundle; the
+code executes in the local page's origin, so its API upload is same-origin
+while editor updates can be deployed without reflashing firmware. The loader
+URL carries a protocol-version query (`?v=`) so Safari does not reuse an older
+ten-minute GitHub Pages cache entry after paired firmware and editor changes.
+Because each deploy replaces the hashed bundle files, a stale cached loader
+can fail for up to ten minutes after a deploy; reloading afterwards recovers.
+The pre-v4 classic `device-uploader.js` app and the shell's legacy XHR
+rewrite shim were removed together; firmware older than the v4 shell must be
+reflashed. Uploads started during the QR refresh wait for the display bus
+instead of failing with a transient `503`.
 As a final compatibility path, a valid token on the initial local page URL
 binds that short-lived session to the browser's LAN address. A legacy
 `/api/image` request from the same address is then accepted even if Safari

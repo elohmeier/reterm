@@ -1,7 +1,5 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { replaceState } from '$app/navigation';
-  import heic2any from 'heic2any';
   import '@fontsource/archivo/400.css';
   import '@fontsource/archivo/600.css';
   import '@fontsource/archivo-black';
@@ -10,6 +8,9 @@
   import { InkStudio, LOOKS, type LookId } from '$lib/editor';
   import { INKINGS, PIGMENTS, SCREEN_HEIGHT, SCREEN_WIDTH, type InkingId } from '$lib/pigments';
   import { STICKERS } from '$lib/stickers';
+  // Inlined so the worker also starts when the bundle is served cross-origin
+  // from GitHub Pages into the device-hosted page.
+  import DitherWorker from '$lib/dither.worker?worker&inline';
   import {
     describeError,
     readSession,
@@ -137,7 +138,7 @@
     proofState = 'cooking';
     inkProgress = 0;
     const image = studio.exportFrame();
-    const job = new Worker(new URL('../lib/dither.worker.ts', import.meta.url), { type: 'module' });
+    const job = new DitherWorker();
     worker = job;
     return new Promise((resolve) => {
       const finish = (packed: Uint8Array | null) => {
@@ -242,6 +243,8 @@
       } catch (nativeError) {
         if (!isHeic) throw nativeError;
         try {
+          // Loaded on demand: only non-Safari browsers fed a HEIC need it.
+          const { default: heic2any } = await import('heic2any');
           const converted = await heic2any({ blob: selectedFile, toType: 'image/jpeg', quality: 0.95 });
           const jpeg = Array.isArray(converted) ? converted[0] : converted;
           if (!(jpeg instanceof Blob)) throw new Error('converter returned no image');
@@ -281,7 +284,7 @@
       stopHeartbeat?.();
       stopHeartbeat = null;
       session = null;
-      replaceState(location.pathname, {});
+      history.replaceState(null, '', location.pathname);
       setStatus('ok', 'Sent! The frame takes about 30 seconds to develop.');
     } catch (error) {
       setStatus(

@@ -2,13 +2,18 @@
 // load-bearing for iOS Safari and Chromium Local Network Access — change them
 // only together with firmware (see AGENTS.md).
 
+// device is '' when the page is served by the E1004 itself; API calls are then
+// same-origin relative requests.
 export type Session = { device: string; token: string };
 
 export function readSession(): Session | null {
   const params = new URLSearchParams(location.hash.slice(1));
   const device = (params.get('device') ?? '').replace(/\/$/, '');
-  const token = params.get('token') ?? '';
-  return device && token ? { device, token } : null;
+  const hashToken = params.get('token') ?? '';
+  if (device && hashToken) return { device, token: hashToken };
+  // Device-served page: the firmware's QR puts the token in the query string.
+  const token = new URLSearchParams(location.search).get('token') ?? '';
+  return token ? { device: '', token } : null;
 }
 
 export function describeError(error: unknown): string {
@@ -24,6 +29,8 @@ export function describeError(error: unknown): string {
 }
 
 export function localRequest(url: string, init: RequestInit): Request {
+  // Same-origin (device-served page): no CORS or address-space hints needed.
+  if (url.startsWith('/')) return new Request(url, init);
   // Chromium requires the Local Network Access hint. WebKit currently fails
   // the entire request when this Chromium-specific option is present.
   const chromium =
