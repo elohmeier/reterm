@@ -25,10 +25,16 @@ QR URL's `model` parameter makes the editor dither for that panel.
    cross-origin local-network uploads; there it reads `#device`/`token` hash
    parameters instead of the device page's `?token=` query and adopts a fresh
    hash without a reload if a new QR is scanned into an already-open tab.
-   The editor composes the photo with stickers, editable text, and free-hand
-   drawing on a fabric.js canvas, applies optional photo looks, and offers
-   five dithering styles with a live six-ink proof. It sends an authenticated
-   15-second `/api/status` heartbeat so long editing sessions do not hit the
+   The editor composes the photo with stickers, editable text, decorative
+   frames (polaroid, postage stamp, newspaper front page), and free-hand
+   drawing on a fabric.js canvas, applies optional photo looks (including
+   virtual B/W lens filters on the monochrome panel), and offers a dozen
+   inking styles — error diffusion, ordered Bayer, tunable halftone/line/
+   crosshatch screens, contour-following etching, and photocopy threshold —
+   with dodge/burn and style-zone brushes and a live proof in the panel's
+   inks. Generative patterns (flow field, Truchet, maze, reaction–diffusion)
+   can replace the photo entirely. It sends an authenticated 15-second
+   `/api/status` heartbeat so long editing sessions do not hit the
    inactivity timeout.
 5. The user chooses a JPEG, PNG, WebP, HEIC, or other browser-decodable image,
    then places it by direct manipulation, optionally adding overlays drawn

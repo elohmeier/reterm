@@ -78,12 +78,58 @@ export function resolveDevice(): DeviceProfile {
   return deviceById(hash.get('model')) ?? deviceById(query.get('model')) ?? DEFAULT_DEVICE;
 }
 
-export type InkingId = 'floyd' | 'atkinson' | 'jarvis' | 'bayer' | 'flat';
+export type InkingId =
+  | 'floyd'
+  | 'atkinson'
+  | 'jarvis'
+  | 'bayer'
+  | 'bayer4'
+  | 'bayer2'
+  | 'dot'
+  | 'line'
+  | 'cross'
+  | 'engrave'
+  | 'photocopy'
+  | 'flat';
+
+/**
+ * Tunables for the screen-based inkings. Pitch and angle drive the halftone
+ * and etching screens; threshold and grain drive the photocopy look. Always
+ * sent with a job; styles ignore what they do not use.
+ */
+export type InkingParams = {
+  pitch: number;
+  angle: number;
+  threshold: number;
+  grain: number;
+};
+
+export function defaultInkingParams(profile: DeviceProfile): InkingParams {
+  // A pitch that reads as newsprint at each panel's size and viewing distance.
+  const pitch = Math.min(16, Math.max(5, Math.round(Math.min(profile.width, profile.height) / 80)));
+  return { pitch, angle: 45, threshold: 0.5, grain: 0.35 };
+}
+
+/** Screens that expose the pitch (and for halftones, angle) sliders. */
+export function usesScreen(id: InkingId): boolean {
+  return id === 'dot' || id === 'line' || id === 'cross' || id === 'engrave';
+}
+
+export function usesAngle(id: InkingId): boolean {
+  return id === 'dot' || id === 'line' || id === 'cross';
+}
 
 export const INKINGS: { id: InkingId; label: string; detail: string }[] = [
   { id: 'floyd', label: 'Classic', detail: 'Floyd–Steinberg' },
   { id: 'atkinson', label: 'Retro', detail: 'Atkinson' },
   { id: 'jarvis', label: 'Smooth', detail: 'Jarvis' },
   { id: 'bayer', label: 'Print', detail: 'Bayer 8×8' },
+  { id: 'bayer4', label: 'Arcade', detail: 'Bayer 4×4' },
+  { id: 'bayer2', label: 'Pixel', detail: 'Bayer 2×2' },
+  { id: 'dot', label: 'Halftone', detail: 'dot screen' },
+  { id: 'line', label: 'Linotone', detail: 'line screen' },
+  { id: 'cross', label: 'Crosshatch', detail: 'crossed screens' },
+  { id: 'engrave', label: 'Etching', detail: 'flow hatching' },
+  { id: 'photocopy', label: 'Xerox', detail: 'threshold + grain' },
   { id: 'flat', label: 'Poster', detail: 'nearest ink' }
 ];

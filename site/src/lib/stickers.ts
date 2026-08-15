@@ -47,6 +47,52 @@ export function stickersFor(profile: DeviceProfile): StickerDef[] {
   const red = profile.color ? hex('Red') : black;
   const blue = profile.color ? hex('Blue') : black;
 
+  // Print-culture motifs for the monochrome frame: woodcut and letterpress
+  // shapes that read as designed artwork instead of collapsed color.
+  const monochromeExtras: StickerDef[] = [
+    {
+      id: 'moon',
+      label: 'Moon',
+      path: 'M 12 -46 A 46 46 0 1 0 12 46 A 37 37 0 1 1 12 -46 Z',
+      fill: black
+    },
+    {
+      id: 'fleuron',
+      label: 'Fleuron',
+      path:
+        'M 0 48 C -34 28 -44 -6 -20 -34 C -8 -46 6 -48 18 -42 C 4 -30 -4 -16 -2 2 ' +
+        'C 10 -10 26 -12 40 -2 C 34 22 18 40 0 48 Z',
+      fill: black
+    },
+    {
+      id: 'divider',
+      label: 'Divider',
+      path: 'M -50 -2 H -12 V 2 H -50 Z M 12 -2 H 50 V 2 H 12 Z M 0 -9 L 9 0 L 0 9 L -9 0 Z',
+      fill: black
+    },
+    {
+      id: 'postmark',
+      label: 'Postmark',
+      path:
+        'M 46 0 A 46 46 0 1 0 -46 0 A 46 46 0 1 0 46 0 ' +
+        'M 36 0 A 36 36 0 1 0 -36 0 A 36 36 0 1 0 36 0 ' +
+        'M -50 -14 Q -38 -22 -25 -14 T 0 -14 T 25 -14 T 50 -14 ' +
+        'M -50 0 Q -38 -8 -25 0 T 0 0 T 25 0 T 50 0 ' +
+        'M -50 14 Q -38 6 -25 14 T 0 14 T 25 14 T 50 14',
+      fill: '',
+      stroke: black,
+      strokeWidth: 4
+    },
+    {
+      id: 'corner',
+      label: 'Corner',
+      path:
+        'M -46 14 L -46 -32 Q -46 -46 -32 -46 L 14 -46 L 14 -36 L -28 -36 ' +
+        'Q -36 -36 -36 -28 L -36 14 Z M -24 -18 L -18 -24 L 2 -24 L -24 2 Z',
+      fill: black
+    }
+  ];
+
   return [
     {
       id: 'sparkle',
@@ -83,6 +129,7 @@ export function stickersFor(profile: DeviceProfile): StickerDef[] {
       path: 'M -50 -16 L 50 -16 L 44 -8 L 50 0 L 44 8 L 50 16 L -50 16 L -44 8 L -50 0 L -44 -8 Z',
       fill: yellow,
       opacity: 0.75
-    }
+    },
+    ...(profile.color ? [] : monochromeExtras)
   ];
 }

@@ -5,9 +5,26 @@
   import '@fontsource/archivo-black';
   import '@fontsource/caveat/700.css';
   import '@fontsource/special-elite';
-  import { InkStudio, LOOKS, type LookId } from '$lib/editor';
-  import { DEVICES, INKINGS, resolveDevice, type DeviceProfile, type InkingId } from '$lib/devices';
+  import {
+    FRAMES,
+    InkStudio,
+    looksFor,
+    type FrameId,
+    type LookId,
+    type ToneKind
+  } from '$lib/editor';
+  import {
+    DEVICES,
+    INKINGS,
+    defaultInkingParams,
+    resolveDevice,
+    usesAngle,
+    usesScreen,
+    type DeviceProfile,
+    type InkingId
+  } from '$lib/devices';
   import { stickersFor } from '$lib/stickers';
+  import { PATTERNS, renderPattern, type PatternId } from '$lib/generative';
   // Inlined so the worker also starts when the bundle is served cross-origin
   // from GitHub Pages into the device-hosted page.
   import DitherWorker from '$lib/dither.worker?worker&inline';
@@ -29,6 +46,12 @@
   // default. /api/status confirms it once a session connects.
   const profile = resolveDevice();
   const STICKERS = stickersFor(profile);
+  const LOOKS_LIST = looksFor(profile.color);
+  const PARAM_DEFAULTS = defaultInkingParams(profile);
+
+  function pigmentHex(name: string): string {
+    return profile.pigments.find((pigment) => pigment.name === name)?.hex ?? '#000000';
+  }
 
   let stageEl: HTMLCanvasElement;
   let proofEl: HTMLCanvasElement;
@@ -41,16 +64,26 @@
   let busy = $state(false);
   let sending = $state(false);
   let view = $state<'photo' | 'ink'>('photo');
-  let tool = $state<'move' | 'text' | 'stickers' | 'draw'>('move');
+  let tool = $state<'move' | 'text' | 'stickers' | 'draw' | 'tone' | 'patterns'>('move');
+  let toneMode = $state<ToneKind>('lighten');
   let ink = $state<string>(profile.pigments[0].hex);
   let brushWidth = $state(16);
   let inking = $state<InkingId>('floyd');
+  let zoneInking = $state<InkingId>('dot');
+  let screenPitch = $state(PARAM_DEFAULTS.pitch);
+  let screenAngle = $state(PARAM_DEFAULTS.angle);
+  let copyThreshold = $state(PARAM_DEFAULTS.threshold);
+  let copyGrain = $state(PARAM_DEFAULTS.grain);
+  let frame = $state<FrameId>('none');
   let look = $state<LookId>('none');
   let brightness = $state(0);
   let contrast = $state(0);
   let saturation = $state(0);
+  let sharpen = $state(0);
+  let grainAmount = $state(0);
   let hasPhoto = $state(false);
   let hasContent = $state(false);
+  let hasZone = $state(false);
   let selected = $state({ count: 0, recolorable: false });
   let proofState = $state<'stale' | 'cooking' | 'fresh'>('stale');
   let inkProgress = $state(0);
@@ -113,6 +146,9 @@
     }
 
     const instance = new InkStudio(stageEl, profile, markDirty, (state) => (selected = state));
+    // Hardware-free E2E hook: lets the test rig drive brush strokes that are
+    // impractical to synthesize as trusted pointer events.
+    (window as unknown as { __inkstudio?: InkStudio }).__inkstudio = instance;
     instance.mountProofLayer(proofEl);
     proofEl.classList.add('proof');
     studio = instance;
@@ -136,10 +172,27 @@
     studio?.setBrush(ink, brushWidth);
   });
   $effect(() => {
-    studio?.setDrawMode(tool === 'draw');
+    studio?.setDrawMode(tool === 'draw' ? 'ink' : tool === 'tone' ? toneMode : null);
   });
   $effect(() => {
-    studio?.setAdjust({ brightness, contrast, saturation });
+    studio?.setAdjust({ brightness, contrast, saturation, sharpen, grain: grainAmount });
+  });
+  // Screen tunables change the wire bytes without touching the canvas, so
+  // they invalidate the proof themselves. Skip the mount-time first run.
+  let paramsSeen = false;
+  $effect(() => {
+    void screenPitch;
+    void screenAngle;
+    void copyThreshold;
+    void copyGrain;
+    void zoneInking;
+    if (!paramsSeen) {
+      paramsSeen = true;
+      return;
+    }
+    proofState = 'stale';
+    proofPacked = null;
+    scheduleProof();
   });
 
   function markDirty() {
@@ -147,6 +200,7 @@
     proofPacked = null;
     hasPhoto = studio?.hasPhoto() ?? false;
     hasContent = !(studio?.isEmpty() ?? true);
+    hasZone = studio?.hasZoneStrokes() ?? false;
     scheduleProof();
   }
 
@@ -160,14 +214,15 @@
     proofTimer = setTimeout(() => void runProof(), delay);
   }
 
-  function runProof(): Promise<Uint8Array | null> {
+  async function runProof(): Promise<Uint8Array | null> {
     finishProof?.(null);
     finishProof = null;
     worker?.terminate();
-    if (!studio || studio.isEmpty()) return Promise.resolve(null);
+    if (!studio || studio.isEmpty()) return null;
     proofState = 'cooking';
     inkProgress = 0;
-    const image = studio.exportFrame();
+    const exported = await studio.exportFrame();
+    const image = exported.image;
     const job = new DitherWorker();
     worker = job;
     return new Promise((resolve) => {
@@ -193,17 +248,29 @@
         proofState = 'stale';
         finish(null);
       };
+      const transfers: Transferable[] = [image.data.buffer];
+      if (exported.tone) transfers.push(exported.tone.buffer);
+      if (exported.zone) transfers.push(exported.zone.buffer);
       job.postMessage(
         {
           rgba: image.data.buffer,
           width: profile.width,
           height: profile.height,
           inking,
+          params: {
+            pitch: screenPitch,
+            angle: screenAngle,
+            threshold: copyThreshold,
+            grain: copyGrain
+          },
           palette: profile.pigments.map((pigment) => pigment.rgb),
           packing: profile.packing,
-          wantPacked: true
+          wantPacked: true,
+          tone: exported.tone?.buffer ?? null,
+          zone: exported.zone?.buffer ?? null,
+          zoneInking
         },
-        [image.data.buffer]
+        transfers
       );
     });
   }
@@ -237,10 +304,34 @@
 
   async function addDateStamp() {
     await document.fonts.load('400 32px "Special Elite"');
-    const stamp = new Date()
-      .toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
-      .toUpperCase();
-    studio?.addText('Special Elite', ink, stamp);
+    // A film-camera corner stamp: red ink on the color panel, knockout-style
+    // white with a black key on the monochrome panel.
+    studio?.addDateStamp(profile.color ? pigmentHex('Red') : '#ffffff', '#000000');
+  }
+
+  async function addKnockout() {
+    await document.fonts.load('400 32px "Archivo Black"');
+    studio?.addText('Archivo Black', ink, 'HELLO', true);
+  }
+
+  async function chooseFrame(id: FrameId) {
+    frame = id;
+    if (id === 'news') {
+      await Promise.all([
+        document.fonts.load('400 32px "Archivo Black"'),
+        document.fonts.load('400 32px "Special Elite"')
+      ]);
+    }
+    studio?.setFrame(id, profile.color ? pigmentHex('Red') : '#000000');
+  }
+
+  function addPattern(id: PatternId) {
+    if (!studio) return;
+    studio.setPhoto(renderPattern(id, profile.width, profile.height));
+    setStatus(
+      session ? 'ok' : 'idle',
+      'Generative print pressed — tap the same tile to reroll, or ink it directly.'
+    );
   }
 
   async function decodeBlob(blob: Blob): Promise<ImageBitmap | HTMLImageElement> {
@@ -326,7 +417,7 @@
       stopHeartbeat = null;
       session = null;
       history.replaceState(null, '', location.pathname);
-      setStatus('ok', 'Sent! The frame takes about 30 seconds to develop.');
+      setStatus('ok', `Sent! Give it a moment — ${profile.refreshNote}.`);
     } catch (error) {
       setStatus(
         'error',
@@ -470,6 +561,31 @@
           <span>Draw</span>
         </button>
         <button
+          class="tool"
+          class:active={tool === 'tone'}
+          aria-pressed={tool === 'tone'}
+          onclick={() => (tool = tool === 'tone' ? 'move' : 'tone')}
+        >
+          <svg viewBox="0 0 24 24"
+            ><circle cx="12" cy="12" r="8" /><path
+              d="M12 4 a8 8 0 0 1 0 16 Z"
+              style="fill: currentColor"
+            /></svg>
+          <span>Tone</span>
+        </button>
+        <button
+          class="tool"
+          class:active={tool === 'patterns'}
+          aria-pressed={tool === 'patterns'}
+          onclick={() => (tool = tool === 'patterns' ? 'move' : 'patterns')}
+        >
+          <svg viewBox="0 0 24 24"
+            ><path d="M4 4h7v7H4z" /><path d="M13 13h7v7h-7z" /><path
+              d="M20 4 A 7 7 0 0 1 13 11"
+            /><path d="M11 20 A 7 7 0 0 1 4 13" /></svg>
+          <span>Patterns</span>
+        </button>
+        <button
           class="tool danger"
           disabled={selected.count === 0}
           onclick={() => studio?.deleteSelection()}
@@ -489,7 +605,11 @@
           <button class="chip fontchip" style:font-family="Special Elite" onclick={addDateStamp}>
             Date stamp
           </button>
+          <button class="chip fontchip knockoutchip" onclick={addKnockout}>Knockout</button>
         </div>
+        <p class="toolnote">
+          Knockout text inverts whatever sits behind it — readable on any background.
+        </p>
       {/if}
 
       {#if tool === 'stickers'}
@@ -499,7 +619,7 @@
               <svg viewBox="-58 -58 116 116">
                 <path
                   d={sticker.path}
-                  fill={sticker.fill}
+                  fill={sticker.fill || 'none'}
                   fill-opacity={sticker.opacity ?? 1}
                   stroke={sticker.stroke ?? 'none'}
                   stroke-width={sticker.strokeWidth ?? 0}
@@ -517,6 +637,54 @@
             <input type="range" min="6" max="60" step="2" bind:value={brushWidth} />
           </label>
         </div>
+      {/if}
+
+      {#if tool === 'tone'}
+        <div class="tray" aria-label="Tone brush">
+          <button class="chip" class:active={toneMode === 'lighten'} onclick={() => (toneMode = 'lighten')}>
+            Dodge
+          </button>
+          <button class="chip" class:active={toneMode === 'darken'} onclick={() => (toneMode = 'darken')}>
+            Burn
+          </button>
+          <button class="chip" class:active={toneMode === 'zone'} onclick={() => (toneMode = 'zone')}>
+            Style zone
+          </button>
+        </div>
+        <div class="tray brushtray">
+          <label class="slider">
+            Brush size
+            <input type="range" min="6" max="60" step="2" bind:value={brushWidth} />
+          </label>
+        </div>
+        {#if hasZone}
+          <label class="slider">
+            Zone inking
+            <select bind:value={zoneInking}>
+              {#each INKINGS as style (style.id)}
+                <option value={style.id}>{style.label} · {style.detail}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
+        <p class="toolnote">
+          Dodge and burn adjust the ink density without painting solid color. Style-zone strokes
+          switch their area to a second inking — the strokes themselves never print.
+        </p>
+      {/if}
+
+      {#if tool === 'patterns'}
+        <div class="tray" aria-label="Generative prints">
+          {#each PATTERNS as pattern (pattern.id)}
+            <button class="chip inkingchip" onclick={() => addPattern(pattern.id)}>
+              <strong>{pattern.label}</strong>
+              <small>{pattern.detail}</small>
+            </button>
+          {/each}
+        </div>
+        <p class="toolnote">
+          Presses a fresh generative print as the photo — tap the same tile to reroll.
+        </p>
       {/if}
 
       <div class="wells">
@@ -548,12 +716,45 @@
             </button>
           {/each}
         </div>
+        {#if usesScreen(inking)}
+          <label class="slider">
+            Screen pitch
+            <input type="range" min="4" max="28" step="1" bind:value={screenPitch} />
+          </label>
+        {/if}
+        {#if usesAngle(inking)}
+          <label class="slider">
+            Screen angle
+            <input type="range" min="0" max="90" step="5" bind:value={screenAngle} />
+          </label>
+        {/if}
+        {#if inking === 'photocopy'}
+          <label class="slider">
+            Threshold
+            <input type="range" min="0.2" max="0.8" step="0.02" bind:value={copyThreshold} />
+          </label>
+          <label class="slider">
+            Grain
+            <input type="range" min="0" max="1" step="0.05" bind:value={copyGrain} />
+          </label>
+        {/if}
+      </fieldset>
+
+      <fieldset class="panel">
+        <legend>Frame</legend>
+        <div class="chips">
+          {#each FRAMES as entry (entry.id)}
+            <button class="chip" class:active={frame === entry.id} onclick={() => chooseFrame(entry.id)}>
+              {entry.label}
+            </button>
+          {/each}
+        </div>
       </fieldset>
 
       <fieldset class="panel" disabled={!hasPhoto}>
         <legend>Photo look</legend>
         <div class="chips">
-          {#each LOOKS as entry (entry.id)}
+          {#each LOOKS_LIST as entry (entry.id)}
             <button class="chip" class:active={look === entry.id} onclick={() => chooseLook(entry.id)}>
               {entry.label}
             </button>
@@ -573,6 +774,14 @@
             <input type="range" min="-0.9" max="0.9" step="0.01" bind:value={saturation} />
           </label>
         {/if}
+        <label class="slider">
+          Sharpen
+          <input type="range" min="0" max="1" step="0.05" bind:value={sharpen} />
+        </label>
+        <label class="slider">
+          Grain
+          <input type="range" min="0" max="0.8" step="0.05" bind:value={grainAmount} />
+        </label>
       </fieldset>
 
       <div class="sendbar">
@@ -982,6 +1191,22 @@
   .slider input {
     width: 100%;
     accent-color: var(--blue);
+  }
+  .slider select {
+    padding: 7px 10px;
+    border: var(--line);
+    border-radius: 10px;
+    background: var(--card);
+    font-weight: 600;
+  }
+  .toolnote {
+    margin: -4px 2px 0;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .knockoutchip {
+    background: var(--ink);
+    color: var(--card);
   }
 
   .sendbar {
