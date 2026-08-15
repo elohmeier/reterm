@@ -74,7 +74,15 @@ timestamp so identical images can be re-sent deliberately.
   session and first publishes the tokenized URL to `reterm/<id>/event`; an HA
   automation can forward it as a phone notification, replacing a walk to the
   device. The token grants uploads for the session window: treat broker read
-  access to `reterm/#` as trusted.
+  access to `reterm/#` as trusted. After a button session the command is left
+  retained (one session per wake); the next timer wake runs it.
+- `{"action":"wifi","id":"…","ssid":"…","password":"…"}` — roams the device
+  to another network by rewriting the saved `wificaptive` credentials; they
+  take effect on the next connection, so expect one more check-in from the
+  old network first. Wrong credentials strand the device until someone runs
+  the physical captive-portal flow — check the `wifi` ack event and the `ip`
+  in the following state. The password sits retained on the broker until the
+  next wake consumes it.
 
 ## Sending an image from the HA side
 

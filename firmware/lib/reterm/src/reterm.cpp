@@ -250,6 +250,8 @@ String dynamicStatusJson() {
   json += WiFi.RSSI();
   json += ",\"wake\":\"";
   json += wakeReason();
+  json += "\",\"ip\":\"";
+  json += WiFi.localIP().toString();
   json += "\",\"wake_interval_min\":";
   json += g_haConfig.wakeMinutes;
   json += "}";
@@ -997,6 +999,7 @@ String haDiscoveryPayload(const String &id) {
          "{{ value_json.rssi }}", true);
   sensor("wake", "Wake reason", nullptr, nullptr, "{{ value_json.wake }}",
          true);
+  sensor("ip", "IP address", nullptr, nullptr, "{{ value_json.ip }}", true);
 
   JsonObject interval = components["wake_interval"].to<JsonObject>();
   interval["platform"] = "number";
@@ -1135,7 +1138,39 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
                  (ok ? "true" : "false") + ",\"id\":\"" + commandId + "\"}");
     return CommandOutcome::Handled;
   }
-  if (action == "session" && allowSession) {
+  if (action == "wifi") {
+    // Roams the device to another network remotely: writes the wificaptive
+    // credentials the provisioning portal would have saved. Takes effect on
+    // the next connection; if they are wrong, recovery is the physical
+    // captive-portal path, so the ack (without the password) matters.
+    const String ssid = doc["ssid"] | "";
+    const String password = doc["password"] | "";
+    bool ok = ssid.length() >= 1 && ssid.length() <= 32 &&
+              password.length() <= 63;
+    if (ok) {
+      Preferences preferences;
+      ok = preferences.begin("wificaptive", false);
+      if (ok) {
+        preferences.putInt("wifi_last_index", 0);
+        preferences.putString("wifi_0_ssid", ssid);
+        preferences.putString("wifi_0_pswd", password);
+        preferences.end();
+      }
+    }
+    if (commandId.length()) storeLastCommandId(commandId);
+    clearRetained(mqttCmdTopic);
+    publishEvent(String("{\"event\":\"wifi\",\"ok\":") + (ok ? "true" : "false") +
+                 ",\"ssid\":\"" + ssid + "\",\"id\":\"" + commandId + "\"}");
+    Serial.println(ok ? "Wi-Fi credentials updated over MQTT; applied on next connection"
+                      : "Wi-Fi command rejected: invalid credentials");
+    return CommandOutcome::Handled;
+  }
+  if (action == "session") {
+    if (!allowSession) {
+      // A button session is already running or just ended. Leave the retained
+      // command untouched so the next timer wake starts the requested session.
+      return CommandOutcome::None;
+    }
     if (commandId.length()) storeLastCommandId(commandId);
     clearRetained(mqttCmdTopic);
     // Publish the tokenized URL before the session begins: the QR screen and
