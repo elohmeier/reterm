@@ -67,7 +67,7 @@ const char kLocalUploader[] PROGMEM = R"HTML(<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>reTerminal Photo Magic</title>
-<link rel="stylesheet" href="https://elohmeier.github.io/reterm/device-uploader.css?v=2">
+<link rel="stylesheet" href="https://elohmeier.github.io/reterm/device-uploader.css?v=3">
 <div id="reterm-uploader">Loading photo editor…</div>
 <script>
 window.RETERM_TOKEN=new URLSearchParams(location.search).get('token')||'';
@@ -80,7 +80,7 @@ XMLHttpRequest.prototype.open=function(method,url,...rest){
   return retermOpen.call(this,method,url,...rest);
 };
 </script>
-<script defer src="https://elohmeier.github.io/reterm/device-uploader.js?v=2"></script>)HTML";
+<script defer src="https://elohmeier.github.io/reterm/device-uploader.js?v=3"></script>)HTML";
 
 void abortPendingImage() {
   if (pendingImage) pendingImage.close();

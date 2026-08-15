@@ -21,3 +21,17 @@
 - Changes to session timeout or framebuffer persistence must preserve the
   pending/current/backup SPIFFS sequence and verify that an unused QR session
   restores the last complete image before deep sleep.
+
+## E1004 color calibration
+
+- Treat the ProRAW profile's measured sRGB values as a reflective appearance
+  record, not as the input-space dithering palette. The photographed paper
+  black has an elevated value; using it directly crushes shadows into physical
+  black and produces a dark, contrasty image.
+- Derive working pigment colors by mapping measured paper black to 0 and white
+  to 1 per channel in linear sRGB, then encode back to sRGB. Keep the raw
+  measured values in the profile for analysis and preview reconstruction.
+- Send indexed calibration targets with `--nominal-palette`; tone adjustment or
+  profile remapping invalidates their known wire indices.
+- Never add the source DNG or private rectified photo diagnostics to the repo.
+  Commit only the numeric profile, synthetic reconstruction, tools, and notes.

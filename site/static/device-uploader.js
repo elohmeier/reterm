@@ -25,7 +25,8 @@
     self.onmessage = event => {
       const { buffer, width, height } = event.data;
       const source = new Uint8ClampedArray(buffer);
-      const palette = [[0,0,0],[255,255,255],[0,145,70],[0,75,190],[210,30,40],[245,205,30]];
+      // Measured hues, normalized in linear light between paper black/white.
+      const palette = [[0,0,0],[255,255,255],[46,174,96],[0,118,175],[204,0,0],[255,209,0]];
       const packed = new Uint8Array(width * height / 2);
       let current = new Float32Array((width + 2) * 3);
       let next = new Float32Array((width + 2) * 3);

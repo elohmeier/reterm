@@ -6,6 +6,7 @@ Seeed Studio reTerminal E1001 and E1004. It contains:
 - `firmware/bringup`: a small custom, offline display bring-up image;
 - `firmware/e1004`: a custom color display image for the 13.3-inch E1004;
 - `site`: the static SvelteKit six-ink photo editor and Wi-Fi upload app;
+- `profiles`: measured E1004 pigment data and synthetic reconstructions;
 - `upstream/seeed-trmnl-1.8.10`: the official open-source firmware snapshot;
 - `upstream/seeed-trmnl-e1004-1.8.10`: the E1004 firmware snapshot;
 - `upstream/binaries/trmnl-1.8.10`: matching official release binaries; and
@@ -46,6 +47,11 @@ sh tools/send-image.sh /path/to/photo.jpg --no-flash
 
 A dithered PNG preview is written to
 `/root/.cache/reterm-e1004-preview.png` before the image is sent.
+The default pigment mapping is derived from an iPhone ProRAW capture with
+linear-light black-point compensation. See
+[docs/color-calibration.md](docs/color-calibration.md) for the repeatable
+target/capture workflow and the important distinction between reflective
+measurements and input-space dithering colors.
 
 ## Wireless photo upload
 

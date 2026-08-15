@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import argparse
+import http.client
+import json
 import math
 import subprocess
 import sys
@@ -23,10 +25,16 @@ WIDTH = 1200
 HEIGHT = 1600
 BAUD = 921600
 MAGIC = b"E1IMG001"
+WEB_MAGIC = b"E1WEB001"
+TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 REPO = Path(__file__).resolve().parents[1]
+DEFAULT_PROFILE = REPO / "profiles" / "e1004-IMG_5327" / "profile.json"
+DEFAULT_TONE_GAMMA = 1.0
 
-# Order is the 3-bit GxEPD2 encoding consumed by the custom panel driver.
-COLORS = [
+# Nominal colors remain useful for index-exact calibration assets. Ordinary
+# photos use the measured profile selected in main(). Order is the 3-bit
+# GxEPD2 encoding consumed by the custom panel driver.
+NOMINAL_COLORS = [
     (0, 0, 0),        # black
     (255, 255, 255),  # white
     (0, 145, 70),     # green
@@ -40,7 +48,43 @@ def orientation_error(size: tuple[int, int]) -> float:
     return abs(math.log((size[0] / size[1]) / (WIDTH / HEIGHT)))
 
 
-def prepare(path: Path, fit: str) -> tuple[bytes, Image.Image, bool]:
+def load_profile_colors(path: Path) -> list[tuple[int, int, int]]:
+    profile = json.loads(path.read_text())
+    entries = sorted(profile["palette"], key=lambda entry: entry["index"])
+    if [entry["index"] for entry in entries] != list(range(6)):
+        raise RuntimeError("color profile does not contain palette indices 0 through 5")
+
+    # The raw measurement includes the photographed paper's elevated black
+    # point. Using it directly as an input-space palette collapses most shadow
+    # and midtone pixels into physical black. Normalize in linear light between
+    # measured paper black and white, retaining the pigments' measured hue.
+    measured = [entry["measured"]["linear_srgb"] for entry in entries]
+    black, white = measured[0], measured[1]
+    if any(len(color) != 3 for color in measured):
+        raise RuntimeError("color profile contains an invalid linear sRGB palette")
+    scales = [white[channel] - black[channel] for channel in range(3)]
+    if any(scale <= 0 for scale in scales):
+        raise RuntimeError("color profile has invalid black/white endpoints")
+
+    def encode(linear: float) -> int:
+        linear = max(0.0, min(1.0, linear))
+        encoded = (12.92 * linear if linear <= 0.0031308
+                   else 1.055 * linear ** (1 / 2.4) - 0.055)
+        return round(encoded * 255)
+
+    return [
+        tuple(encode((color[channel] - black[channel]) / scales[channel])
+              for channel in range(3))
+        for color in measured
+    ]
+
+
+def prepare(
+    path: Path,
+    fit: str,
+    colors: list[tuple[int, int, int]],
+    tone_gamma: float,
+) -> tuple[bytes, Image.Image, bool]:
     register_heif_opener()
     with Image.open(path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGB")
@@ -58,13 +102,28 @@ def prepare(path: Path, fit: str) -> tuple[bytes, Image.Image, bool]:
         image.paste(contained, ((WIDTH - contained.width) // 2,
                                 (HEIGHT - contained.height) // 2))
 
+    # Spectra photos tend to read darker than their on-screen source. Lift
+    # shadows and midtones without moving black or white; values above one
+    # brighten because the transfer exponent is the reciprocal of gamma.
+    if tone_gamma != 1:
+        exponent = 1 / tone_gamma
+        channel_lut = [round(255 * (value / 255) ** exponent) for value in range(256)]
+        image = image.point(channel_lut * 3)
+
     palette = Image.new("P", (1, 1))
-    flat = [component for color in COLORS for component in color]
-    palette.putpalette(flat + [0] * (768 - len(flat)))
+    flat = [component for color in colors for component in color]
+    # Pillow requires 256 palette entries and may select the padding during
+    # quantization. Make every unused slot a duplicate of physical black, then
+    # collapse those duplicate indices back to wire value zero below.
+    padding = list(colors[0]) * (256 - len(colors))
+    full_palette = flat + padding
+    palette.putpalette(full_palette)
     indexed = image.quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG)
-    pixels = indexed.tobytes()
-    if max(pixels) >= len(COLORS):
-        raise RuntimeError("quantizer emitted an unexpected palette index")
+    quantized = indexed.tobytes()
+    pixels = bytes(value if value < len(colors) else 0 for value in quantized)
+    if pixels != quantized:
+        indexed = Image.frombytes("P", indexed.size, pixels)
+        indexed.putpalette(full_palette)
     packed = bytearray(WIDTH * HEIGHT // 2)
     for pos in range(0, len(pixels), 2):
         packed[pos // 2] = (pixels[pos] << 4) | pixels[pos + 1]
@@ -99,7 +158,7 @@ def wait_for_ready(port: str) -> serial.Serial:
     raise RuntimeError("device did not announce image receiver")
 
 
-def send(port: str, packed: bytes) -> None:
+def send_uart(port: str, packed: bytes) -> None:
     device = wait_for_ready(port)
     try:
         device.write(MAGIC)
@@ -124,11 +183,79 @@ def send(port: str, packed: bytes) -> None:
         device.close()
 
 
+def device_line(device: serial.Serial) -> str | None:
+    line = device.readline()
+    if not line:
+        return None
+    text = line.decode("utf-8", "replace").strip()
+    print(f"device: {text}")
+    return text
+
+
+def send_http(port: str, packed: bytes) -> None:
+    """Start a deterministic test session and upload over checksummed TCP."""
+    device = wait_for_ready(port)
+    try:
+        handshake = WEB_MAGIC + TEST_TOKEN.encode("ascii")
+        if device.write(handshake) != len(handshake):
+            raise RuntimeError("short write while starting HTTP test session")
+        device.flush()
+
+        address: str | None = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            text = device_line(device)
+            if text and text.startswith("UPLOAD API http://"):
+                address = text.removeprefix("UPLOAD API http://")
+                break
+        if address is None:
+            raise RuntimeError("device did not announce the HTTP upload API")
+
+        origin = f"http://{address}"
+        path = f"/api/image/{TEST_TOKEN}"
+        print(f"uploading {len(packed):,} bytes to {origin}{path}")
+        connection = http.client.HTTPConnection(address, 80, timeout=120)
+        try:
+            connection.request(
+                "POST",
+                path,
+                body=packed,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Origin": origin,
+                },
+            )
+            response = connection.getresponse()
+            body = response.read().decode("utf-8", "replace")
+            print(f"HTTP {response.status}: {body}")
+            if response.status != 202:
+                raise RuntimeError(f"HTTP upload failed with status {response.status}")
+        finally:
+            connection.close()
+
+        deadline = time.monotonic() + 70
+        while time.monotonic() < deadline:
+            text = device_line(device)
+            if text == "HTTP image displayed":
+                return
+        raise RuntimeError("timed out waiting for panel refresh")
+    finally:
+        device.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("--port", default="/dev/ttyUSB0")
     parser.add_argument("--fit", choices=("cover", "contain"), default="cover")
+    parser.add_argument("--transport", choices=("uart", "http"), default="uart",
+                        help="transfer via direct UART or a Wi-Fi test session")
+    parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE,
+                        help="measured panel profile used for color matching")
+    parser.add_argument("--nominal-palette", action="store_true",
+                        help="disable calibration for index-exact test assets")
+    parser.add_argument("--tone-gamma", type=float, default=DEFAULT_TONE_GAMMA,
+                        help="photo tone lift; 1 disables it (default: %(default)s)")
     parser.add_argument("--preview", type=Path,
                         default=Path("/root/.cache/reterm-e1004-preview.png"))
     parser.add_argument("--no-flash", action="store_true",
@@ -137,12 +264,20 @@ def main() -> int:
                         help="write the dithered preview without contacting the device")
     args = parser.parse_args()
 
-    packed, preview, rotated = prepare(args.image, args.fit)
+    if args.tone_gamma <= 0:
+        parser.error("--tone-gamma must be greater than zero")
+    colors = NOMINAL_COLORS if args.nominal_palette else load_profile_colors(args.profile)
+    tone_gamma = 1.0 if args.nominal_palette else args.tone_gamma
+    packed, preview, rotated = prepare(args.image, args.fit, colors, tone_gamma)
     args.preview.parent.mkdir(parents=True, exist_ok=True)
     preview.save(args.preview)
     print(f"prepared {args.image}: 1200x1600, fit={args.fit}, "
           f"auto-rotated={'yes' if rotated else 'no'}")
     print(f"dithered preview: {args.preview}")
+    print("color matching: " +
+          ("nominal/index-exact" if args.nominal_palette else str(args.profile)))
+    print(f"photo tone gamma: {tone_gamma:.2f}" +
+          (" (disabled for index-exact asset)" if args.nominal_palette else ""))
 
     if args.prepare_only:
         return 0
@@ -152,7 +287,10 @@ def main() -> int:
         run(["uvx", "--from", "esptool", "esptool", "--chip", "esp32s3",
              "--port", args.port, "--baud", "460800", "write-flash", "0x90000",
              "firmware/e1004/.pio/build/reterminal-e1004/firmware.bin"])
-    send(args.port, packed)
+    if args.transport == "http":
+        send_http(args.port, packed)
+    else:
+        send_uart(args.port, packed)
     return 0
 
 

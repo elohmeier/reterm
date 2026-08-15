@@ -1,12 +1,13 @@
-// The six E Ink Spectra 6 pigments in the GxEPD2 order the firmware expects.
-// Index into this array IS the wire value: 0 black … 5 yellow.
+// Measured E1004-COLOR-V1 pigments with linear-light black-point compensation.
+// This keeps the calibrated hues but maps reflective paper black/white back to
+// input-space 0/255. Index into this array IS the GxEPD2 wire value.
 export const PIGMENTS = [
   { name: 'Black', rgb: [0, 0, 0], hex: '#000000' },
   { name: 'White', rgb: [255, 255, 255], hex: '#ffffff' },
-  { name: 'Green', rgb: [0, 145, 70], hex: '#009146' },
-  { name: 'Blue', rgb: [0, 75, 190], hex: '#004bbe' },
-  { name: 'Red', rgb: [210, 30, 40], hex: '#d21e28' },
-  { name: 'Yellow', rgb: [245, 205, 30], hex: '#f5cd1e' }
+  { name: 'Green', rgb: [46, 174, 96], hex: '#2eae60' },
+  { name: 'Blue', rgb: [0, 118, 175], hex: '#0076af' },
+  { name: 'Red', rgb: [204, 0, 0], hex: '#cc0000' },
+  { name: 'Yellow', rgb: [255, 209, 0], hex: '#ffd100' }
 ] as const;
 
 export const SCREEN_WIDTH = 1200;
