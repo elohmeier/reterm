@@ -1,9 +1,10 @@
 #!/bin/sh
 # Assembles ESP Web Tools manifests and binaries for the browser flasher at
 # site/flash.html. Expects both firmware projects to be built already
-# (pio run -d firmware/e1001 and -d firmware/e1004). Offsets mirror Seeed's
-# official manifests: bootloader 0x0, partition table 0x8000, OTA data
-# initialiser 0xe000, application 0x10000.
+# (pio run -d firmware/e1001 and -d firmware/e1004). Offsets follow this
+# repo's firmware/*/partitions.csv, NOT Seeed's stock layout: bootloader 0x0,
+# partition table 0x8000, OTA data initialiser 0x86000 (otadata), application
+# 0x90000 (app0) — the same offset tools/send-image.py flashes over USB.
 set -eu
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -38,8 +39,8 @@ for model in reterminal-e1001 reterminal-e1004; do
       "parts": [
         { "path": "bootloader.bin", "offset": 0 },
         { "path": "partitions.bin", "offset": 32768 },
-        { "path": "boot_app0.bin", "offset": 57344 },
-        { "path": "firmware.bin", "offset": 65536 }
+        { "path": "boot_app0.bin", "offset": 549888 },
+        { "path": "firmware.bin", "offset": 589824 }
       ]
     }
   ]

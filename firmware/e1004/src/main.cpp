@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <GxEPD2_7C.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
 #include <qrcode.h>
 #include <reterm.h>
@@ -190,6 +191,13 @@ class E1004Board final : public reterm::Board {
     pinMode(kButton, INPUT_PULLUP);
     prepareTouchWake();
     esp_sleep_enable_ext0_wakeup(kButton, 0);
+    // The bistable panel keeps its image unpowered, but its rail otherwise
+    // stays energized through deep sleep. Cut it and latch the pin low; the
+    // other panel lines float in deep sleep, so nothing backfeeds the rail.
+    // setup() releases the hold before init drives the rail high again.
+    digitalWrite(kEnable, LOW);
+    gpio_hold_en(gpio_num_t(kEnable));
+    gpio_deep_sleep_hold_en();
   }
 };
 
@@ -200,6 +208,11 @@ void setup() {
   Serial.begin(reterm::kImageBaud);
   delay(200);
   Serial.println("reterm E1004 custom color card: boot");
+
+  // Release the deep-sleep latch on the panel rail before display.init()
+  // needs to drive it high again.
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis(gpio_num_t(kEnable));
 
   epaperSpi.begin(kSck, kMiso, kMosi, -1);
   Wire.begin(kTouchSda, kTouchScl);

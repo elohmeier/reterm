@@ -12,6 +12,7 @@ import argparse
 import http.client
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -162,8 +163,8 @@ def prepare(
     return bytes(packed), indexed.convert("RGB"), rotated
 
 
-def run(command: list[str]) -> None:
-    subprocess.run(command, cwd=REPO, check=True)
+def run(command: list[str], env: dict[str, str] | None = None) -> None:
+    subprocess.run(command, cwd=REPO, check=True, env=env)
 
 
 def wait_for_ready(port: str, ready_prefix: str) -> serial.Serial:
@@ -242,6 +243,10 @@ def send_http(port: str, packed: bytes, ready_prefix: str) -> None:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             text = device_line(device)
+            if text and text.startswith("UART fixture disabled"):
+                raise RuntimeError(
+                    "device firmware was built without RETERM_UPLOAD_FIXTURE; "
+                    "rerun without --no-flash to install a test build")
             if text and text.startswith("UPLOAD API http://"):
                 address = text.removeprefix("UPLOAD API http://")
                 break
@@ -336,7 +341,17 @@ def main() -> int:
         return 0
 
     if not args.no_flash:
-        run(["sh", "tools/build-container.sh", device["project"]])
+        env = None
+        if args.transport == "http":
+            # The deterministic test session token only exists in firmware
+            # built with the fixture flag; release builds never carry it.
+            env = dict(os.environ, PLATFORMIO_BUILD_FLAGS="-DRETERM_UPLOAD_FIXTURE")
+        run(["sh", "tools/build-container.sh", device["project"]], env=env)
+        # USB flashing writes app0. Erase otadata first so a device that last
+        # booted an OTA image from app1 selects the freshly written slot again.
+        run(["uvx", "--from", "esptool", "esptool", "--chip", "esp32s3",
+             "--port", args.port, "--baud", "460800", "erase-region",
+             "0x86000", "0x2000"])
         run(["uvx", "--from", "esptool", "esptool", "--chip", "esp32s3",
              "--port", args.port, "--baud", "460800", "write-flash", "0x90000",
              device["firmware"]])

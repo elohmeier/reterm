@@ -100,7 +100,7 @@ upload command to physical panel refresh from about 24 seconds to 3.3 seconds.
 
 The API listens on port 80 of the address encoded in the QR.
 
-### `OPTIONS /api/status` or `/api/image`
+### `OPTIONS /api/status`, `/api/image`, `/api/firmware`, or `/api/wifi/forget`
 
 Successful preflights from the production Pages origin return:
 
@@ -138,6 +138,37 @@ driver: 0 black, 1 white, 2 green, 3 blue, 4 red, and 5 yellow. The first pixel
 is in the high nibble. Values 6 and 7 are not accepted from the browser
 quantizer.
 
+### `POST /api/firmware/:token`
+
+```http
+Content-Type: application/octet-stream
+Content-Length: <firmware.bin size>
+```
+
+Streams an application image into the inactive OTA slot (`partitions.csv`
+reserves two 12 MiB slots). Authentication matches the image endpoints: the
+exact per-session path is the bearer credential, and legacy `/api/firmware`
+accepts the `X-Upload-Token` header or the bound client address. The body is
+written through the Arduino `Update` API, which validates the image while
+writing and flips `otadata` only on success, so an interrupted upload leaves
+the running firmware untouched. On `202 {"status":"rebooting"}` the device
+drains the socket, reboots into the new image, preserves the panel content,
+and deep sleeps. `tools/ota-update.sh` drives this endpoint either against a
+live session QR (`--address`/`--token`) or through the UART fixture handshake
+on test builds. USB flashing via `tools/send-image.py` erases `otadata`
+first, so a subsequent `esptool` write to `app0` always takes effect even
+after an OTA booted from `app1`.
+
+### `POST /api/wifi/forget`
+
+Requires session authentication. Clears the saved home network from the
+`wificaptive` NVS namespace; the current association stays up so the response
+can be delivered, and the next button wake opens the captive portal again.
+On the E1001 the same reset is available without network access: hold the
+green button for five seconds through a wake. The E1004's capacitive
+controller only provides a wake edge to this firmware, so it relies on the
+API path.
+
 ## Security properties
 
 - Tokens contain 128 bits from `esp_fill_random()`.
@@ -157,6 +188,16 @@ quantizer.
 - Only a complete, validated upload replaces the persisted framebuffer; a
   backup filename protects the last good image during the final rename.
 - First-run access point passwords are generated randomly for each attempt.
+- The deterministic UART test token used by `tools/send-image.py --transport
+  http` and `tools/ota-update.py` exists only in firmware built with
+  `-DRETERM_UPLOAD_FIXTURE` (the image tool sets it automatically when it
+  builds a test firmware). Release and CI builds reject the fixture suffix
+  and always use RNG tokens.
+- OTA acceptance is bounded by the same session authentication as image
+  uploads. The `Update` API validates image structure, not authorship — there
+  is no code signing — so the OTA trust level equals the session token's,
+  which matches the physical-access trust level of these non-secure-boot
+  units.
 
 The local API uses HTTP. The token protects authorization, but image bytes can
 still be observed by another party on the same Wi-Fi. Supporting trusted HTTPS

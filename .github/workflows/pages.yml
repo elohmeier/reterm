@@ -6,7 +6,9 @@ on:
     paths:
       - "site/**"
       - "firmware/**"
+      - "profiles/**"
       - "tools/package-web-flash.sh"
+      - "tools/check-palette-sync.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -24,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The editor's E1004 pigment literals must match the measured profile.
+      - run: python3 tools/check-palette-sync.py
       - uses: actions/setup-node@v4
         with:
           node-version: 22

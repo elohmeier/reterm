@@ -41,6 +41,10 @@ class Board {
 
   // True when this boot was caused by the board's wake control.
   virtual bool wokeByButton() const = 0;
+  // Called once right after a button wake. Return true when the user keeps
+  // holding the wake control long enough to request forgetting the saved
+  // Wi-Fi credentials. Boards without hold detection keep the default.
+  virtual bool wakeHoldRequestsWifiReset() { return false; }
   // Configure wake sources; called immediately before deep sleep.
   virtual void prepareSleep() = 0;
 };

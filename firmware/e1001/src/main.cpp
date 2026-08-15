@@ -122,6 +122,16 @@ class E1001Board final : public reterm::Board {
     }
     return false;
   }
+  bool wakeHoldRequestsWifiReset() override {
+    // Keep holding the green button for five seconds through the wake to
+    // forget the saved network. A normal tap releases within the first poll.
+    const uint32_t deadline = millis() + 5000;
+    while (digitalRead(kGreenButton) == LOW) {
+      if (int32_t(deadline - millis()) <= 0) return true;
+      delay(20);
+    }
+    return false;
+  }
   void prepareSleep() override {
     pinMode(kGreenButton, INPUT_PULLUP);
     esp_sleep_enable_ext0_wakeup(kGreenButton, 0);

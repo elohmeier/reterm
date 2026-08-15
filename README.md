@@ -80,6 +80,24 @@ E1004, 48,000 bytes on the E1001.
 See [docs/wifi-upload.md](docs/wifi-upload.md) for the state machine, API,
 security model, GitHub Pages deployment, and browser compatibility notes.
 
+To change networks later, hold the E1001's green button for five seconds
+through a wake, or call the authenticated `POST /api/wifi/forget` endpoint
+during an open session; the next wake shows the captive portal again.
+
+## Update firmware over Wi-Fi
+
+An open upload session also accepts a firmware image on
+`POST /api/firmware/<token>`. The device writes it into the inactive OTA
+slot, validates it, and reboots while keeping the displayed photo:
+
+```sh
+sh tools/ota-update.sh --device e1004 --address 192.168.1.50 --token <from QR>
+```
+
+Without `--address`, the tool starts a deterministic test session over USB,
+which requires firmware built with `-DRETERM_UPLOAD_FIXTURE` (test builds
+only; `send-image.sh --transport http` installs one automatically).
+
 The pinned build container supplies the glibc environment required by
 PlatformIO's aarch64 Espressif compiler; on glibc x86_64 hosts a native
 `platformio` works directly.

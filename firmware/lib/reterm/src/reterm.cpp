@@ -3,6 +3,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_random.h>
@@ -13,6 +14,8 @@ namespace {
 
 constexpr uint32_t kUploadWindowMs = 5 * 60 * 1000;
 constexpr uint32_t kUploadAbsoluteMaxMs = 30 * 60 * 1000;
+// Each OTA slot in partitions.csv is 12 MiB.
+constexpr size_t kMaxFirmwareBytes = 0xC00000;
 constexpr char kAllowedOrigin[] = "https://elohmeier.github.io";
 constexpr char kSavedImagePath[] = "/current-image.bin";
 constexpr char kBackupImagePath[] = "/previous-image.bin";
@@ -36,6 +39,10 @@ size_t httpBytes = 0;
 int16_t httpY = 0;
 int httpResult = 500;
 String httpAuthDebug;
+int otaResult = 500;
+String otaAuthDebug;
+volatile bool otaReady = false;
+volatile bool otaResponseSent = false;
 volatile bool imageReady = false;
 volatile bool httpTaskRunning = false;
 volatile bool acceptingImages = false;
@@ -134,17 +141,24 @@ StartupCommand receiveStartupCommand() {
   }
   if (memcmp(header, webMagic, sizeof(header)) == 0) {
     // A fixture may append a known 32-character token for an authenticated
-    // end-to-end test. Physical UART access already permits reflashing these
-    // non-secure-boot development units; normal button sessions always use RNG.
+    // end-to-end test. That fixed token must never ship in release builds;
+    // tools/send-image.py enables RETERM_UPLOAD_FIXTURE when it builds a test
+    // firmware for --transport http. Normal button sessions always use RNG.
     const uint32_t tokenDeadline = millis() + 250;
     while (Serial.available() < 32 && int32_t(tokenDeadline - millis()) > 0) delay(2);
     if (Serial.available() >= 32) {
       char testToken[33] = {};
       if (Serial.readBytes(reinterpret_cast<uint8_t *>(testToken), 32) == 32) {
+#if defined(RETERM_UPLOAD_FIXTURE)
         // Receipt of the 32-byte fixture suffix is the opt-in signal. Use a
         // stable printable token even if this high-speed UART corrupts a byte.
         uartSessionToken = "0123456789abcdef0123456789abcdef";
         Serial.println("UART test token accepted");
+#else
+        // Drain the suffix so it cannot linger in the receive buffer, then
+        // fall through to a normal randomly tokenized session.
+        Serial.println("UART fixture disabled; using a random session token");
+#endif
       }
     }
     return StartupCommand::Web;
@@ -216,12 +230,17 @@ void handleOptions() {
   server.send(204);
 }
 
+bool tokenizedRoute() {
+  // Only the exact, randomly generated per-session URIs are registered with
+  // handlers. If dispatch reached one of them, its path is already the bearer
+  // credential; avoid redundantly comparing mutable String storage.
+  return server.uri().startsWith("/api/image/") ||
+         server.uri().startsWith("/api/firmware/");
+}
+
 bool requestAuthorized() {
   if (!originAllowed()) return false;
-  // Only the exact, randomly generated per-session URI is registered with an
-  // image handler. If dispatch reached that handler, its path is already the
-  // bearer credential; avoid redundantly comparing mutable String storage.
-  if (server.uri().startsWith("/api/image/")) return true;
+  if (tokenizedRoute()) return true;
   if (constantTimeToken(server.header("X-Upload-Token"))) return true;
   if (authorizedClientIpSet && server.client().remoteIP() == authorizedClientIp)
     return true;
@@ -231,7 +250,7 @@ bool requestAuthorized() {
 String requestAuthDebug() {
   const String origin = server.header("Origin");
   String detail = "route=";
-  detail += server.uri().startsWith("/api/image/") ? "tokenized" : "legacy";
+  detail += tokenizedRoute() ? "tokenized" : "legacy";
   detail += ", header=";
   detail += server.header("X-Upload-Token").length();
   detail += ", peer=";
@@ -260,6 +279,28 @@ void handleStatus() {
   }
   sessionLastActivity = millis();
   server.send(200, "application/json", g_board->statusJson());
+}
+
+void forgetWifiCredentials() {
+  Preferences preferences;
+  if (preferences.begin("wificaptive", false)) {
+    preferences.clear();
+    preferences.end();
+  }
+}
+
+// Clears the saved home network. The current association stays up so the
+// response can be delivered; the next button wake opens the captive portal.
+void handleWifiForget() {
+  addCorsHeaders();
+  if (!requestAuthorized()) {
+    server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+    return;
+  }
+  sessionLastActivity = millis();
+  forgetWifiCredentials();
+  Serial.println("Saved Wi-Fi credentials cleared by API request");
+  server.send(200, "application/json", "{\"status\":\"forgotten\"}");
 }
 
 void handleRawImage() {
@@ -353,6 +394,87 @@ void handleImageResult() {
   }
 }
 
+// Streams an application image into the inactive OTA slot. partitions.csv
+// reserves app0/app1; Update selects the slot that is not currently running,
+// validates the image header while writing, and flips otadata on success.
+void handleFirmwareRaw() {
+  HTTPRaw &raw = server.raw();
+  if (raw.status == RAW_START) {
+    // Match the image path: hold an early POST until the QR refresh has
+    // finished so flash writes never overlap a panel refresh.
+    const uint32_t readyDeadline = millis() + 60000;
+    while (!acceptingImages && httpTaskRunning &&
+           int32_t(readyDeadline - millis()) > 0) {
+      delay(10);
+    }
+    otaAuthDebug = requestAuthDebug();
+    const size_t length = server.clientContentLength();
+    otaResult = acceptingImages && requestAuthorized()
+                    ? 202
+                    : (acceptingImages ? 401 : 503);
+    if (otaResult == 202 && (length == 0 || length > kMaxFirmwareBytes))
+      otaResult = 413;
+    if (otaResult == 202 && !Update.begin(length, U_FLASH)) {
+      Update.abort();
+      otaResult = 507;
+    }
+    if (otaResult == 202) sessionLastActivity = millis();
+    return;
+  }
+  if (raw.status == RAW_ABORTED) {
+    Update.abort();
+    if (otaResult == 202) otaResult = 400;
+    return;
+  }
+  if (raw.status == RAW_WRITE && otaResult == 202) {
+    sessionLastActivity = millis();
+    if (Update.write(raw.buf, raw.currentSize) != raw.currentSize) {
+      Update.abort();
+      otaResult = 507;
+      return;
+    }
+    // Yield like the image path so IDLE0 and the watchdog can run while the
+    // synchronous raw parser drains a multi-megabyte body.
+    delay(1);
+    return;
+  }
+  if (raw.status == RAW_END && otaResult == 202) {
+    if (Update.end()) {
+      otaReady = true;
+    } else {
+      Update.abort();
+      otaResult = 400;
+    }
+  }
+}
+
+void handleFirmwareResult() {
+  addCorsHeaders();
+  if (otaResult == 202 && otaReady) {
+    server.send(202, "application/json", "{\"status\":\"rebooting\"}");
+    otaResponseSent = true;
+  } else if (otaResult == 413) {
+    server.send(413, "application/json",
+                "{\"error\":\"expected 1 to " + String(kMaxFirmwareBytes) +
+                    " firmware bytes\"}");
+  } else if (otaResult == 401) {
+    Serial.print("Firmware update unauthorized: ");
+    Serial.println(otaAuthDebug);
+    server.send(401, "application/json",
+                "{\"error\":\"unauthorized (" + otaAuthDebug + ")\"}");
+  } else if (otaResult == 503) {
+    server.send(503, "application/json", "{\"error\":\"display is starting\"}");
+  } else if (otaResult == 507) {
+    server.send(507, "application/json",
+                "{\"error\":\"could not start update (" +
+                    String(Update.errorString()) + ")\"}");
+  } else {
+    server.send(400, "application/json",
+                "{\"error\":\"incomplete firmware (" +
+                    String(Update.errorString()) + ")\"}");
+  }
+}
+
 void serveHttp(void *) {
   while (httpTaskRunning) {
     server.handleClient();
@@ -363,6 +485,7 @@ void serveHttp(void *) {
 
 void startUploadServer() {
   const String imagePath = "/api/image/" + sessionToken;
+  const String firmwarePath = "/api/firmware/" + sessionToken;
   const char *headers[] = {"Origin", "X-Upload-Token", "Content-Type",
                            "Access-Control-Request-Private-Network"};
   server.collectHeaders(headers, 4);
@@ -377,9 +500,15 @@ void startUploadServer() {
   // The token is already present in the QR URL, so an exact per-session path
   // provides an equivalent same-origin authentication channel.
   server.on(imagePath, HTTP_POST, handleImageResult, handleRawImage);
+  server.on("/api/firmware", HTTP_POST, handleFirmwareResult, handleFirmwareRaw);
+  server.on(firmwarePath, HTTP_POST, handleFirmwareResult, handleFirmwareRaw);
+  server.on("/api/wifi/forget", HTTP_POST, handleWifiForget);
   server.on("/api/status", HTTP_OPTIONS, handleOptions);
   server.on("/api/image", HTTP_OPTIONS, handleOptions);
   server.on(imagePath, HTTP_OPTIONS, handleOptions);
+  server.on("/api/firmware", HTTP_OPTIONS, handleOptions);
+  server.on(firmwarePath, HTTP_OPTIONS, handleOptions);
+  server.on("/api/wifi/forget", HTTP_OPTIONS, handleOptions);
   server.onNotFound([] { server.send(404, "application/json", "{\"error\":\"not found\"}"); });
   server.begin();
   httpTaskRunning = true;
@@ -499,6 +628,9 @@ void runUploadSession() {
   const uint32_t wifiStartedAt = millis();
   if ((!wifiStarted || !waitForWifi(20000)) && !provisionWifi()) {
     Serial.println("Wi-Fi connection/provisioning failed");
+    // The panel still shows the dead provisioning screen; bring back the last
+    // complete image like the session-timeout paths do.
+    if (!restoreSavedImage()) Serial.println("No saved image available to restore");
     return;
   }
   Serial.print("Wi-Fi ready ms = ");
@@ -528,7 +660,7 @@ void runUploadSession() {
   const uint32_t sessionStarted = millis();
   sessionLastActivity = sessionStarted;
   uint32_t lastReconnectAttempt = sessionStarted;
-  while (!uploadResponseSent &&
+  while (!uploadResponseSent && !otaResponseSent &&
          millis() - sessionLastActivity < kUploadWindowMs &&
          millis() - sessionStarted < kUploadAbsoluteMaxMs) {
     if (WiFi.status() != WL_CONNECTED &&
@@ -542,12 +674,22 @@ void runUploadSession() {
   // server.send() can return once the small 202 response is queued locally.
   // Keep the HTTP task and socket alive long enough for the peer to ACK it;
   // stopping after the old 10 ms grace could emit a TCP reset on real Wi-Fi.
-  if (uploadResponseSent) delay(1000);
+  if (uploadResponseSent || otaResponseSent) delay(1000);
   acceptingImages = false;
   httpTaskRunning = false;
   delay(10);
   server.stop();
   sessionToken = "";
+
+  if (otaReady) {
+    // Update.end() already validated the image and flipped otadata to the
+    // other slot. The new firmware boots, finds no host command, preserves
+    // the panel image, and deep sleeps.
+    Serial.println("Firmware update received; rebooting into the new image");
+    Serial.flush();
+    delay(100);
+    ESP.restart();
+  }
 
   if (imageReady) {
     Serial.println("HTTP image received; refreshing display");
@@ -586,6 +728,10 @@ void run(Board &board) {
   Serial.println(imageStorageReady ? "yes" : "no");
 
   const bool buttonWake = board.wokeByButton();
+  if (buttonWake && board.wakeHoldRequestsWifiReset()) {
+    Serial.println("Wake control held; forgetting saved Wi-Fi credentials");
+    forgetWifiCredentials();
+  }
   // A physical wake is unambiguous and should react immediately. Retain the
   // three-second UART recovery window only for reset/power-on host workflows.
   const StartupCommand command =

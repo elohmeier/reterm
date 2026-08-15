@@ -38,6 +38,20 @@
   the serial log reaches `HTTP image displayed`. Browser-path HTTP tests must
   include the real same-origin `Origin` header; command-line clients that
   omit it do not exercise Safari's origin checks.
+- The deterministic UART test session only exists in firmware built with
+  `-DRETERM_UPLOAD_FIXTURE`. `tools/send-image.py --transport http` sets the
+  flag itself when it builds and flashes; with `--no-flash` the device must
+  already run a fixture build or the tool aborts on the firmware's
+  `UART fixture disabled` line. Never add the flag to release or CI builds.
+- Flash offsets come from `firmware/*/partitions.csv`: app at `0x90000`,
+  `otadata` at `0x86000` — NOT Seeed's stock `0x10000` layout. The web-flash
+  manifests (`tools/package-web-flash.sh`) and `tools/send-image.py` must
+  stay in agreement with the partition tables. USB flashing erases `otadata`
+  first so it overrides any prior `/api/firmware` OTA that booted from
+  `app1`.
+- `tools/check-palette-sync.py` (run in CI) fails when the E1004 pigment
+  literals in `site/src/lib/devices.ts` diverge from the measured profile;
+  after a recalibration regenerate those literals, do not delete the check.
 - Changes to session timeout or framebuffer persistence must preserve the
   pending/current/backup SPIFFS sequence and verify that an unused QR session
   restores the last complete image before deep sleep.
