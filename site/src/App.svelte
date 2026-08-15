@@ -6,7 +6,7 @@
   import '@fontsource/caveat/700.css';
   import '@fontsource/special-elite';
   import { InkStudio, LOOKS, type LookId } from '$lib/editor';
-  import { INKINGS, resolveDevice, type InkingId } from '$lib/devices';
+  import { DEVICES, INKINGS, resolveDevice, type DeviceProfile, type InkingId } from '$lib/devices';
   import { stickersFor } from '$lib/stickers';
   // Inlined so the worker also starts when the bundle is served cross-origin
   // from GitHub Pages into the device-hosted page.
@@ -64,6 +64,15 @@
   function setStatus(tone: typeof statusTone, text: string) {
     statusTone = tone;
     statusText = text;
+  }
+
+  /** Reload with a model hint; the profile shapes the canvas, so it is fixed per page load. */
+  function switchModel(device: DeviceProfile) {
+    if (device.id === profile.id) return;
+    const url = new URL(location.href);
+    url.searchParams.set('model', device.id.replace('reterminal-', ''));
+    url.hash = '';
+    location.href = url.toString();
   }
 
   function adoptSession() {
@@ -361,6 +370,25 @@
   <p class="ticket" data-tone={statusTone} role="status">
     {statusText}{#if proofState === 'cooking' && sending}&nbsp;{inkProgress}%{/if}
   </p>
+
+  {#if !session}
+    <div class="framebar">
+      <span class="framebar-label">Designing for</span>
+      {#each Object.values(DEVICES) as device (device.id)}
+        <button
+          class="chip"
+          class:active={device.id === profile.id}
+          aria-pressed={device.id === profile.id}
+          onclick={() => switchModel(device)}
+        >
+          {device.short}
+        </button>
+      {/each}
+      <a class="flashlink" href="https://elohmeier.github.io/reterm/flash.html">
+        Flash a frame&nbsp;&rarr;
+      </a>
+    </div>
+  {/if}
 
   <div class="studio">
     <section class="bench">
@@ -672,6 +700,26 @@
   .ticket[data-tone='busy'] {
     border-color: var(--blue);
     box-shadow: 3px 3px 0 var(--blue);
+  }
+
+  .framebar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: -8px 0 20px;
+    padding: 0 6px;
+  }
+  .framebar-label {
+    font-family: 'Special Elite', monospace;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .flashlink {
+    margin-left: auto;
+    font-weight: 600;
+    font-size: 0.85rem;
+    color: var(--blue);
   }
 
   .studio {
