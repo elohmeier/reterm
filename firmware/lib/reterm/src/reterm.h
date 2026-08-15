@@ -10,6 +10,12 @@
 
 class Adafruit_GFX;
 
+// Reported over /api/status and MQTT. CI builds override this with the deploy
+// label; local builds report "dev".
+#ifndef RETERM_FW_VERSION
+#define RETERM_FW_VERSION "dev"
+#endif
+
 namespace reterm {
 
 // Both boards stream full-screen images over their CH341 UART at this rate.

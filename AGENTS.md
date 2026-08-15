@@ -11,6 +11,16 @@
   rows); E1001 is 800×480 1bpp (48,000 bytes, 100-byte rows, bit set = white,
   MSB is the leftmost pixel). The palette/bit order IS the wire format on both
   the site and firmware sides.
+- Home Assistant integration (`docs/home-assistant.md`): when a broker is
+  configured via `POST /api/config` (NVS namespace `reterm-ha`), `goToSleep`
+  arms a timer wake and each wake runs an MQTT check-in — discovery + retained
+  state out, retained `reterm/<id>/cmd` and wake-interval topics in. Retained
+  commands re-deliver on every wake; the last-processed command id in NVS is
+  the dedupe. Image commands fetch the exact packed wire format over http://
+  and must keep the SPIFFS pending/current/backup sequence. `/api/status` is
+  composed dynamically (battery, RSSI, wake, `RETERM_FW_VERSION` — CI injects
+  the deploy label, local builds report `dev`); the board `statusJson()` stays
+  a static geometry literal that `dynamicStatusJson()` reopens.
 
 ## Device-hosted web assets
 

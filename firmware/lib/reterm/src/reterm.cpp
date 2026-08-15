@@ -1,13 +1,17 @@
 #include "reterm.h"
 
+#include <ArduinoJson.h>
 #include <DNSServer.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
+#include <PubSubClient.h>
 #include <SPIFFS.h>
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_random.h>
 #include <esp_sleep.h>
+#include <mbedtls/sha256.h>
 
 namespace reterm {
 namespace {
@@ -20,6 +24,32 @@ constexpr char kAllowedOrigin[] = "https://elohmeier.github.io";
 constexpr char kSavedImagePath[] = "/current-image.bin";
 constexpr char kBackupImagePath[] = "/previous-image.bin";
 constexpr char kPendingImagePath[] = "/pending-image.bin";
+
+// Both boards route VBAT through a 1:2 divider on GPIO1 (ADC1) gated by a
+// load switch on GPIO21, so the divider only draws current while sampling.
+constexpr int kBatteryAdcPin = 1;
+constexpr int kBatteryEnablePin = 21;
+
+// Home Assistant / MQTT settings, persisted in their own NVS namespace next
+// to the wificaptive credentials. An empty broker host disables the feature
+// entirely: no timer wake is armed and check-ins are skipped.
+struct HaConfig {
+  String host;
+  uint16_t port = 1883;
+  String user;
+  String password;
+  uint32_t wakeMinutes = 0;
+  bool enabled() const { return host.length() > 0; }
+};
+constexpr char kHaPrefsNamespace[] = "reterm-ha";
+constexpr uint32_t kMaxWakeMinutes = 24 * 60;
+constexpr uint32_t kDefaultWakeMinutes = 60;
+
+HaConfig g_haConfig;
+int g_batteryMv = -1;  // sampled once per boot, before any radio powers up
+// True once this boot parked the panel controller. A second hibernate on an
+// already-sleeping controller stalls on BUSY timeouts, so guard against it.
+bool g_panelHibernated = false;
 
 Board *g_board = nullptr;
 Geometry g_geometry;
@@ -121,6 +151,111 @@ bool restoreSavedImage() {
   return true;
 }
 
+// Samples VBAT while everything else is still quiet. Wi-Fi load sags the
+// battery enough to skew the reading, so run() calls this before any radio
+// starts. The first conversion after enabling the divider is discarded.
+int readBatteryMillivolts() {
+  pinMode(kBatteryEnablePin, OUTPUT);
+  digitalWrite(kBatteryEnablePin, HIGH);
+  delay(10);
+  analogSetPinAttenuation(kBatteryAdcPin, ADC_11db);
+  analogReadMilliVolts(kBatteryAdcPin);
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; ++i) sum += analogReadMilliVolts(kBatteryAdcPin);
+  digitalWrite(kBatteryEnablePin, LOW);
+  return int(sum / 8) * 2;
+}
+
+// Single-cell LiPo open-circuit voltage mapped to charge, linear between
+// curve points. Only an approximation: these boards have no fuel gauge.
+int batteryPercent(int millivolts) {
+  struct Point { int mv; int pct; };
+  static constexpr Point curve[] = {{4200, 100}, {4060, 90}, {3980, 80},
+                                    {3920, 70},  {3870, 60}, {3820, 50},
+                                    {3790, 40},  {3770, 30}, {3740, 20},
+                                    {3680, 10},  {3300, 0}};
+  if (millivolts >= curve[0].mv) return 100;
+  for (size_t i = 1; i < sizeof(curve) / sizeof(curve[0]); ++i) {
+    if (millivolts >= curve[i].mv) {
+      const Point &high = curve[i - 1];
+      const Point &low = curve[i];
+      return low.pct + (high.pct - low.pct) * (millivolts - low.mv) /
+                           (high.mv - low.mv);
+    }
+  }
+  return 0;
+}
+
+const char *wakeReason() {
+  switch (esp_sleep_get_wakeup_cause()) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      return "button";
+    case ESP_SLEEP_WAKEUP_TIMER:
+      return "timer";
+    default:
+      return "power";
+  }
+}
+
+void loadHaConfig() {
+  Preferences preferences;
+  if (!preferences.begin(kHaPrefsNamespace, true)) return;
+  g_haConfig.host = preferences.getString("host", "");
+  g_haConfig.port = preferences.getUShort("port", 1883);
+  g_haConfig.user = preferences.getString("user", "");
+  g_haConfig.password = preferences.getString("pass", "");
+  g_haConfig.wakeMinutes = preferences.getUInt("wake_min", 0);
+  preferences.end();
+}
+
+bool saveHaConfig() {
+  Preferences preferences;
+  if (!preferences.begin(kHaPrefsNamespace, false)) return false;
+  preferences.putString("host", g_haConfig.host);
+  preferences.putUShort("port", g_haConfig.port);
+  preferences.putString("user", g_haConfig.user);
+  preferences.putString("pass", g_haConfig.password);
+  preferences.putUInt("wake_min", g_haConfig.wakeMinutes);
+  preferences.end();
+  return true;
+}
+
+// Retained MQTT commands are re-delivered on every wake; the id of the last
+// processed command is persisted so duplicates are dropped, not re-run.
+String loadLastCommandId() {
+  Preferences preferences;
+  if (!preferences.begin(kHaPrefsNamespace, true)) return "";
+  const String id = preferences.getString("last_cmd", "");
+  preferences.end();
+  return id;
+}
+
+void storeLastCommandId(const String &id) {
+  Preferences preferences;
+  if (!preferences.begin(kHaPrefsNamespace, false)) return;
+  preferences.putString("last_cmd", id);
+  preferences.end();
+}
+
+// The board supplies the static geometry object; reopen it and append the
+// per-boot fields so /api/status and MQTT report live device state.
+String dynamicStatusJson() {
+  String json(g_board->statusJson());
+  json.remove(json.length() - 1);
+  json += ",\"fw\":\"" RETERM_FW_VERSION "\",\"battery_mv\":";
+  json += g_batteryMv;
+  json += ",\"battery_pct\":";
+  json += batteryPercent(g_batteryMv);
+  json += ",\"rssi\":";
+  json += WiFi.RSSI();
+  json += ",\"wake\":\"";
+  json += wakeReason();
+  json += "\",\"wake_interval_min\":";
+  json += g_haConfig.wakeMinutes;
+  json += "}";
+  return json;
+}
+
 StartupCommand receiveStartupCommand() {
   static constexpr char imageMagic[] = "E1IMG001";
   static constexpr char webMagic[] = "E1WEB001";
@@ -185,10 +320,18 @@ StartupCommand receiveStartupCommand() {
 
 void goToSleep() {
   Serial.println("Entering deep sleep; press the button for upload mode");
+  if (g_haConfig.enabled() && g_haConfig.wakeMinutes > 0) {
+    Serial.print("Timer wake armed for Home Assistant check-in, minutes = ");
+    Serial.println(g_haConfig.wakeMinutes);
+  }
   Serial.flush();
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
   g_board->prepareSleep();
+  if (g_haConfig.enabled() && g_haConfig.wakeMinutes > 0) {
+    esp_sleep_enable_timer_wakeup(uint64_t(g_haConfig.wakeMinutes) * 60ULL *
+                                  1000000ULL);
+  }
   delay(50);
   esp_deep_sleep_start();
 }
@@ -278,7 +421,7 @@ void handleStatus() {
     return;
   }
   sessionLastActivity = millis();
-  server.send(200, "application/json", g_board->statusJson());
+  server.send(200, "application/json", dynamicStatusJson());
 }
 
 void forgetWifiCredentials() {
@@ -301,6 +444,61 @@ void handleWifiForget() {
   forgetWifiCredentials();
   Serial.println("Saved Wi-Fi credentials cleared by API request");
   server.send(200, "application/json", "{\"status\":\"forgotten\"}");
+}
+
+String haConfigJson() {
+  JsonDocument doc;
+  doc["mqtt_host"] = g_haConfig.host;
+  doc["mqtt_port"] = g_haConfig.port;
+  doc["mqtt_user"] = g_haConfig.user;
+  doc["mqtt_password_set"] = g_haConfig.password.length() > 0;
+  doc["wake_interval_min"] = g_haConfig.wakeMinutes;
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+void handleConfigGet() {
+  addCorsHeaders();
+  if (!requestAuthorized()) {
+    server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+    return;
+  }
+  sessionLastActivity = millis();
+  server.send(200, "application/json", haConfigJson());
+}
+
+// Accepts form fields mqtt_host, mqtt_port, mqtt_user, mqtt_password, and
+// wake_interval_min; only supplied fields change. Setting a broker host with
+// no interval on record enables the default hourly check-in, and an empty
+// host disables the Home Assistant integration entirely.
+void handleConfigPost() {
+  addCorsHeaders();
+  if (!requestAuthorized()) {
+    server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+    return;
+  }
+  sessionLastActivity = millis();
+  if (server.hasArg("mqtt_host")) g_haConfig.host = server.arg("mqtt_host");
+  if (server.hasArg("mqtt_port")) {
+    const long port = server.arg("mqtt_port").toInt();
+    if (port > 0 && port <= 65535) g_haConfig.port = uint16_t(port);
+  }
+  if (server.hasArg("mqtt_user")) g_haConfig.user = server.arg("mqtt_user");
+  if (server.hasArg("mqtt_password"))
+    g_haConfig.password = server.arg("mqtt_password");
+  if (server.hasArg("wake_interval_min")) {
+    const long minutes = server.arg("wake_interval_min").toInt();
+    g_haConfig.wakeMinutes = uint32_t(constrain(minutes, 0L, long(kMaxWakeMinutes)));
+  } else if (g_haConfig.enabled() && g_haConfig.wakeMinutes == 0) {
+    g_haConfig.wakeMinutes = kDefaultWakeMinutes;
+  }
+  if (!saveHaConfig()) {
+    server.send(500, "application/json", "{\"error\":\"could not save config\"}");
+    return;
+  }
+  Serial.println("Home Assistant configuration updated by API request");
+  server.send(200, "application/json", haConfigJson());
 }
 
 void handleRawImage() {
@@ -503,7 +701,10 @@ void startUploadServer() {
   server.on("/api/firmware", HTTP_POST, handleFirmwareResult, handleFirmwareRaw);
   server.on(firmwarePath, HTTP_POST, handleFirmwareResult, handleFirmwareRaw);
   server.on("/api/wifi/forget", HTTP_POST, handleWifiForget);
+  server.on("/api/config", HTTP_GET, handleConfigGet);
+  server.on("/api/config", HTTP_POST, handleConfigPost);
   server.on("/api/status", HTTP_OPTIONS, handleOptions);
+  server.on("/api/config", HTTP_OPTIONS, handleOptions);
   server.on("/api/image", HTTP_OPTIONS, handleOptions);
   server.on(imagePath, HTTP_OPTIONS, handleOptions);
   server.on("/api/firmware", HTTP_OPTIONS, handleOptions);
@@ -702,6 +903,340 @@ void runUploadSession() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Home Assistant check-in: on every timer wake (and after upload sessions)
+// the device publishes its stats over MQTT with HA discovery metadata, then
+// consumes retained command topics. HA can never reach a deep-sleeping
+// device, so retained messages are the command channel: whatever HA last
+// published is applied on the next wake.
+
+WiFiClient mqttSocket;
+PubSubClient mqtt(mqttSocket);
+String mqttCmdTopic;
+String mqttSetWakeTopic;
+String mqttStateTopic;
+String mqttEventTopic;
+String pendingCmdPayload;
+String pendingWakePayload;
+bool pendingCmdSeen = false;
+bool pendingWakeSeen = false;
+
+// The AP-name suffix scheme: stable across reflashes, unique per unit.
+String haDeviceId() {
+  const uint64_t chip = ESP.getEfuseMac();
+  char suffix[7];
+  snprintf(suffix, sizeof(suffix), "%06lx",
+           static_cast<unsigned long>(chip & 0xffffff));
+  return String(g_board->hostname()) + "-" + suffix;
+}
+
+void onMqttMessage(char *topic, uint8_t *payload, unsigned int length) {
+  String value;
+  value.reserve(length);
+  for (unsigned int i = 0; i < length; ++i) value += char(payload[i]);
+  if (mqttCmdTopic == topic) {
+    pendingCmdPayload = value;
+    pendingCmdSeen = true;
+  } else if (mqttSetWakeTopic == topic) {
+    pendingWakePayload = value;
+    pendingWakeSeen = true;
+  }
+}
+
+void clearRetained(const String &topic) {
+  mqtt.publish(topic.c_str(), nullptr, 0, true);
+}
+
+void publishEvent(const String &json) {
+  mqtt.publish(mqttEventTopic.c_str(), json.c_str(), false);
+}
+
+String haStatePayload() { return dynamicStatusJson(); }
+
+// One retained device-based discovery payload (HA 2024.6+) declaring every
+// entity. Republished each check-in so a wiped broker heals itself.
+String haDiscoveryPayload(const String &id) {
+  JsonDocument doc;
+  JsonObject device = doc["device"].to<JsonObject>();
+  device["identifiers"][0] = id;
+  device["name"] = String("reTerminal ") + g_board->uartName() + " " +
+                   id.substring(id.length() - 6);
+  device["manufacturer"] = "Seeed Studio";
+  device["model"] = g_board->model();
+  device["sw_version"] = RETERM_FW_VERSION;
+  JsonObject origin = doc["origin"].to<JsonObject>();
+  origin["name"] = "reterm";
+  origin["url"] = "https://github.com/elohmeier/reterm";
+  JsonObject components = doc["components"].to<JsonObject>();
+
+  const auto sensor = [&](const char *key, const char *name,
+                          const char *deviceClass, const char *unit,
+                          const char *valueTemplate, bool diagnostic) {
+    JsonObject component = components[key].to<JsonObject>();
+    component["platform"] = "sensor";
+    component["unique_id"] = id + "_" + key;
+    component["name"] = name;
+    if (deviceClass) component["device_class"] = deviceClass;
+    if (unit) {
+      component["unit_of_measurement"] = unit;
+      component["state_class"] = "measurement";
+    }
+    component["value_template"] = valueTemplate;
+    component["state_topic"] = mqttStateTopic;
+    if (diagnostic) component["entity_category"] = "diagnostic";
+    // Retained state persists across HA restarts; expiry marks the device
+    // unavailable when it misses two consecutive check-ins.
+    if (g_haConfig.wakeMinutes > 0)
+      component["expire_after"] = g_haConfig.wakeMinutes * 60 * 2 + 300;
+  };
+  sensor("battery", "Battery", "battery", "%",
+         "{{ value_json.battery_pct }}", false);
+  sensor("voltage", "Battery voltage", "voltage", "mV",
+         "{{ value_json.battery_mv }}", true);
+  sensor("rssi", "Wi-Fi RSSI", "signal_strength", "dBm",
+         "{{ value_json.rssi }}", true);
+  sensor("wake", "Wake reason", nullptr, nullptr, "{{ value_json.wake }}",
+         true);
+
+  JsonObject interval = components["wake_interval"].to<JsonObject>();
+  interval["platform"] = "number";
+  interval["unique_id"] = id + "_wake_interval";
+  interval["name"] = "Wake interval";
+  interval["command_topic"] = mqttSetWakeTopic;
+  interval["state_topic"] = mqttStateTopic;
+  interval["value_template"] = "{{ value_json.wake_interval_min }}";
+  interval["min"] = 0;
+  interval["max"] = kMaxWakeMinutes;
+  interval["step"] = 5;
+  interval["unit_of_measurement"] = "min";
+  interval["mode"] = "box";
+  interval["entity_category"] = "config";
+  // The broker must hold the change until the sleeping device's next wake.
+  interval["retain"] = true;
+
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+// Downloads a full packed framebuffer (the device wire format, same bytes as
+// POST /api/image) and displays it, mirroring the HTTP upload path's SPIFFS
+// pending/commit sequence. The optional sha256 is verified before the panel
+// refreshes or the image is committed.
+bool fetchAndDisplayImage(const String &url, const String &sha256Hex) {
+  HTTPClient http;
+  if (!url.startsWith("http://") || !http.begin(url)) {
+    Serial.println("Image command rejected: only http:// URLs are supported");
+    return false;
+  }
+  http.setTimeout(15000);
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.print("Image fetch failed, HTTP ");
+    Serial.println(code);
+    http.end();
+    return false;
+  }
+  if (http.getSize() != int(g_geometry.imageBytes())) {
+    Serial.print("Image fetch rejected: expected bytes = ");
+    Serial.println(g_geometry.imageBytes());
+    http.end();
+    return false;
+  }
+  if (!beginPendingImage()) {
+    http.end();
+    return false;
+  }
+
+  const bool wantHash = sha256Hex.length() == 64;
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  if (wantHash) mbedtls_sha256_starts_ret(&sha, 0);
+
+  WiFiClient &stream = http.getStream();
+  stream.setTimeout(15000);
+  bool ok = true;
+  for (int16_t y = 0; y < g_geometry.height && ok; ++y) {
+    if (stream.readBytes(mainRow, g_geometry.rowBytes) != g_geometry.rowBytes) {
+      Serial.print("Image fetch failed: short row ");
+      Serial.println(y);
+      ok = false;
+      break;
+    }
+    if (pendingImage.write(mainRow, g_geometry.rowBytes) !=
+        g_geometry.rowBytes) {
+      ok = false;
+      break;
+    }
+    if (wantHash) mbedtls_sha256_update_ret(&sha, mainRow, g_geometry.rowBytes);
+    g_board->writeRow(mainRow, y);
+    // A large body outlasts the MQTT keepalive; service the connection.
+    if ((y % 100) == 99) mqtt.loop();
+  }
+  http.end();
+
+  if (ok && wantHash) {
+    uint8_t digest[32];
+    mbedtls_sha256_finish_ret(&sha, digest);
+    char hex[65];
+    static constexpr char alphabet[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+      hex[i * 2] = alphabet[digest[i] >> 4];
+      hex[i * 2 + 1] = alphabet[digest[i] & 0x0f];
+    }
+    hex[64] = 0;
+    String expected = sha256Hex;
+    expected.toLowerCase();
+    if (expected != hex) {
+      Serial.println("Image fetch failed: sha256 mismatch");
+      ok = false;
+    }
+  }
+  mbedtls_sha256_free(&sha);
+
+  if (!ok) {
+    abortPendingImage();
+    return false;
+  }
+  if (!commitPendingImage()) return false;
+  Serial.println("MQTT image received; refreshing display");
+  g_board->refresh();
+  g_board->hibernate();
+  g_panelHibernated = true;
+  Serial.println("MQTT image displayed");
+  return true;
+}
+
+enum class CommandOutcome { None, Handled, SessionRequested };
+
+CommandOutcome processCommand(const String &payload, bool allowSession) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) {
+    Serial.println("Ignoring malformed MQTT command");
+    publishEvent("{\"event\":\"error\",\"detail\":\"malformed command\"}");
+    clearRetained(mqttCmdTopic);
+    return CommandOutcome::Handled;
+  }
+  const String action = doc["action"] | "";
+  const String commandId = doc["id"] | "";
+  if (commandId.length() && commandId == loadLastCommandId()) {
+    // Retained duplicate of a command that already ran; drop it silently.
+    clearRetained(mqttCmdTopic);
+    return CommandOutcome::None;
+  }
+
+  if (action == "image") {
+    const String url = doc["url"] | "";
+    const String sha = doc["sha256"] | "";
+    const bool ok = url.length() && fetchAndDisplayImage(url, sha);
+    if (commandId.length()) storeLastCommandId(commandId);
+    clearRetained(mqttCmdTopic);
+    publishEvent(String("{\"event\":\"image\",\"ok\":") +
+                 (ok ? "true" : "false") + ",\"id\":\"" + commandId + "\"}");
+    return CommandOutcome::Handled;
+  }
+  if (action == "session" && allowSession) {
+    if (commandId.length()) storeLastCommandId(commandId);
+    clearRetained(mqttCmdTopic);
+    // Publish the tokenized URL before the session begins: the QR screen and
+    // upload loop monopolize the device once the session starts. Anyone who
+    // can read this topic can upload for the next five minutes.
+    uartSessionToken = makeToken();
+    const String url = "http://" + WiFi.localIP().toString() +
+                       "/?token=" + uartSessionToken +
+                       "&model=" + g_board->model();
+    publishEvent("{\"event\":\"session\",\"url\":\"" + url + "\"}");
+    Serial.println("MQTT session command accepted");
+    return CommandOutcome::SessionRequested;
+  }
+
+  Serial.print("Ignoring unsupported MQTT command action: ");
+  Serial.println(action);
+  if (commandId.length()) storeLastCommandId(commandId);
+  clearRetained(mqttCmdTopic);
+  publishEvent("{\"event\":\"error\",\"detail\":\"unsupported action\"}");
+  return CommandOutcome::Handled;
+}
+
+// Returns true when a retained session command asks for a full upload
+// session; the caller runs it after the MQTT connection is torn down.
+bool runHaCheckin(bool allowSession) {
+  if (!g_haConfig.enabled()) return false;
+  if (WiFi.status() != WL_CONNECTED && !connectSavedWifi()) {
+    Serial.println("Check-in skipped: Wi-Fi unavailable");
+    return false;
+  }
+
+  const String id = haDeviceId();
+  mqttStateTopic = "reterm/" + id + "/state";
+  mqttCmdTopic = "reterm/" + id + "/cmd";
+  mqttSetWakeTopic = "reterm/" + id + "/set/wake-interval";
+  mqttEventTopic = "reterm/" + id + "/event";
+  pendingCmdSeen = pendingWakeSeen = false;
+
+  mqtt.setServer(g_haConfig.host.c_str(), g_haConfig.port);
+  mqtt.setBufferSize(4096);
+  mqtt.setKeepAlive(60);
+  mqtt.setCallback(onMqttMessage);
+  const bool connected =
+      g_haConfig.user.length()
+          ? mqtt.connect(id.c_str(), g_haConfig.user.c_str(),
+                         g_haConfig.password.c_str())
+          : mqtt.connect(id.c_str());
+  if (!connected) {
+    Serial.print("Check-in skipped: MQTT connect failed, state = ");
+    Serial.println(mqtt.state());
+    return false;
+  }
+  Serial.println("MQTT connected; publishing state and reading commands");
+
+  mqtt.subscribe(mqttCmdTopic.c_str());
+  mqtt.subscribe(mqttSetWakeTopic.c_str());
+  // Retained messages arrive right after SUBACK; a short poll collects them.
+  const uint32_t retainedDeadline = millis() + 3000;
+  while (int32_t(retainedDeadline - millis()) > 0) {
+    mqtt.loop();
+    delay(10);
+  }
+
+  // Apply a pending interval change first so the discovery expiry and the
+  // state below already reflect it, then consume the retained value.
+  if (pendingWakeSeen && pendingWakePayload.length()) {
+    const long minutes = pendingWakePayload.toInt();
+    const uint32_t wanted =
+        uint32_t(constrain(minutes, 0L, long(kMaxWakeMinutes)));
+    if (wanted != g_haConfig.wakeMinutes) {
+      g_haConfig.wakeMinutes = wanted;
+      saveHaConfig();
+      Serial.print("Wake interval updated over MQTT, minutes = ");
+      Serial.println(wanted);
+    }
+    clearRetained(mqttSetWakeTopic);
+  }
+
+  mqtt.publish(("homeassistant/device/" + id + "/config").c_str(),
+               haDiscoveryPayload(id).c_str(), true);
+  mqtt.publish(mqttStateTopic.c_str(), haStatePayload().c_str(), true);
+
+  CommandOutcome outcome = CommandOutcome::None;
+  if (pendingCmdSeen && pendingCmdPayload.length()) {
+    outcome = processCommand(pendingCmdPayload, allowSession);
+    if (outcome == CommandOutcome::Handled) {
+      // The command may have taken a while (image fetch + refresh); leave a
+      // fresh retained state behind.
+      mqtt.publish(mqttStateTopic.c_str(), haStatePayload().c_str(), true);
+    }
+  }
+
+  const uint32_t drainDeadline = millis() + 200;
+  while (int32_t(drainDeadline - millis()) > 0) {
+    mqtt.loop();
+    delay(10);
+  }
+  mqtt.disconnect();
+  return outcome == CommandOutcome::SessionRequested;
+}
+
 }  // namespace
 
 String makeToken() {
@@ -723,9 +1258,29 @@ void run(Board &board) {
   httpRow = new uint8_t[g_geometry.rowBytes];
   mainRow = new uint8_t[g_geometry.rowBytes];
 
+  g_batteryMv = readBatteryMillivolts();
+  Serial.print("Battery mV = ");
+  Serial.println(g_batteryMv);
+  loadHaConfig();
+
   imageStorageReady = SPIFFS.begin(true);
   Serial.print("Image storage ready = ");
   Serial.println(imageStorageReady ? "yes" : "no");
+
+  // A timer wake exists only for the Home Assistant check-in: publish stats,
+  // apply whatever HA left on the retained command topics, sleep again. The
+  // panel is untouched unless a command replaced the image.
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("Timer wake: Home Assistant check-in");
+    if (runHaCheckin(true)) {
+      runUploadSession();
+    } else if (!g_panelHibernated) {
+      // setup() reset the panel controller; park it again like the
+      // no-command path so it does not draw standby current through sleep.
+      board.hibernate();
+    }
+    goToSleep();
+  }
 
   const bool buttonWake = board.wokeByButton();
   if (buttonWake && board.wakeHoldRequestsWifiReset()) {
@@ -739,6 +1294,9 @@ void run(Board &board) {
   if (command == StartupCommand::Image) goToSleep();
   if (command == StartupCommand::Web || buttonWake) {
     runUploadSession();
+    // Wi-Fi is usually still associated here, so the extra state publish is
+    // nearly free. Session commands are refused: one session per wake.
+    runHaCheckin(false);
     goToSleep();
   }
 
