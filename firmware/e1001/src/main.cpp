@@ -106,8 +106,8 @@ void drawUploadQr(const String &url) {
                           page * display.pageHeight(),
                           (page + 1) * display.pageHeight(), GxEPD_BLACK);
     ++page;
-    centeredText("Scan within five minutes", 414, 2);
-    centeredText("Choose, crop, preview, upload!", 446, 2);
+    centeredText("Scan within five minutes to send a photo", 414, 2);
+    centeredText("Hold the GREEN button for the menu instead", 446, 2);
   } while (display.nextPage());
 }
 
@@ -279,7 +279,7 @@ void drawChoiceScreen(const RpsScore &score) {
       cellText(kMoveButtons[move], cellX[move], 342, 2);
     }
     centeredText(scores.c_str(), 398, 2);
-    centeredText("Idle for a minute puts the display back to sleep", 446, 2);
+    centeredText("Hold GREEN for the menu - a minute idle sleeps", 446, 2);
   } while (display.nextPage());
 }
 
@@ -316,8 +316,8 @@ void drawResultScreen(int player, int machine, int diff,
       }
     }
     centeredText(scores.c_str(), 402, 2);
-    centeredText("Rematch with a top button:", 430, 2);
-    centeredText("LEFT rock    GREEN paper    RIGHT scissors", 456, 2);
+    centeredText("Rematch: LEFT rock  GREEN paper  RIGHT scissors", 430, 2);
+    centeredText("Hold GREEN for the menu", 456, 2);
   } while (display.nextPage());
 }
 
@@ -347,26 +347,57 @@ void waitForButtonsReleased() {
   }
 }
 
-int waitForButton(uint32_t timeoutMs) {
+// Green distinguishes a tap (reported on release) from a hold: holding for
+// kLongPressMs is the universal "open the menu" gesture, so green actions
+// inside games stay on the tap. The white buttons keep firing on the press
+// itself for snappy game moves.
+constexpr uint32_t kLongPressMs = 900;
+
+struct ButtonPress {
+  int button;  // -1 = timeout
+  bool longPress;
+};
+
+ButtonPress waitForPress(uint32_t timeoutMs) {
   const uint32_t deadline = millis() + timeoutMs;
   while (int32_t(deadline - millis()) > 0) {
     const int button = readButton();
-    if (button >= 0) {
-      delay(30);  // debounce: accept only if the same press is still down
-      if (readButton() == button) return button;
+    if (button < 0) {
+      delay(10);
+      continue;
     }
-    delay(10);
+    delay(30);  // debounce: accept only if the same press is still down
+    if (readButton() != button) continue;
+    if (button != kBtnGreen) return {button, false};
+    const uint32_t pressedAt = millis();
+    while (digitalRead(kGreenButton) == LOW) {
+      if (millis() - pressedAt >= kLongPressMs) return {kBtnGreen, true};
+      delay(10);
+    }
+    return {kBtnGreen, false};
   }
-  return -1;
+  return {-1, false};
 }
 
-void playRockPaperScissors() {
+// Returns true when the player held green to go back to the menu; false on
+// the idle timeout, which leaves the last screen on the panel.
+bool playRockPaperScissors() {
   Serial.println("Arcade: rock paper scissors");
   RpsScore score = loadRpsScore();
   waitForButtonsReleased();
   drawChoiceScreen(score);
-  for (int player = waitForButton(kGameIdleMs); player >= 0;
-       player = waitForButton(kGameIdleMs)) {
+  for (;;) {
+    const ButtonPress press = waitForPress(kGameIdleMs);
+    if (press.button < 0) {
+      Serial.println("Game idle; handing back to the standard flow");
+      waitForButtonsReleased();
+      return false;
+    }
+    if (press.button == kBtnGreen && press.longPress) {
+      waitForButtonsReleased();
+      return true;
+    }
+    const int player = press.button;  // button order matches the move order
     const int machine = int(esp_random() % 3);
     const int diff = (player - machine + 3) % 3;
     if (diff == 1) ++score.wins;
@@ -382,10 +413,6 @@ void playRockPaperScissors() {
     drawResultScreen(player, machine, diff, score);
     waitForButtonsReleased();
   }
-  // The last screen stays on the panel; run() hibernates the controller and
-  // re-arms every wake source through its no-command path.
-  Serial.println("Game idle; handing back to the standard flow");
-  waitForButtonsReleased();
 }
 
 // --- Arcade sprites --------------------------------------------------------
@@ -795,8 +822,8 @@ bool runPetScreen() {
   for (;;) {
     drawPetScreen(pet);
     for (;;) {
-      const int button = waitForButton(kGameIdleMs);
-      if (button < 0) {
+      const ButtonPress press = waitForPress(kGameIdleMs);
+      if (press.button < 0) {
         pet.onWall = true;
         pet.wallSum = savedImageChecksum();
         savePet(pet);
@@ -804,21 +831,21 @@ bool runPetScreen() {
         return false;
       }
       waitForButtonsReleased();
-      if (button == kBtnGreen) return true;
+      if (press.button == kBtnGreen) return true;  // tap or hold: the menu
       const PetStage stage = petStage(pet);
       if (stage == PetStage::Gone) {
-        if (button == kBtnLeft) {
+        if (press.button == kBtnLeft) {
           pet = PetState();
           pet.adopted = true;
           break;
         }
       } else if (stage != PetStage::Egg) {
-        if (button == kBtnLeft) {
+        if (press.button == kBtnLeft) {
           pet.fedMin = min(kPetFedMaxMin, pet.fedMin + kPetFeedMin);
           pet.starvedMin = 0;
           break;
         }
-        if (button == kBtnRight) {
+        if (press.button == kBtnRight) {
           pet.joyMin = min(kPetJoyMaxMin, pet.joyMin + kPetPlayMin);
           break;
         }
@@ -858,58 +885,73 @@ void petTimerTick() {
 
 void drawMenuScreen(int selected) {
   static constexpr const char *entries[] = {
-      "ROCK PAPER SCISSORS", "LUNA THE UNICORN", "BACK TO THE PHOTO"};
+      "ROCK PAPER SCISSORS", "LUNA THE UNICORN", "SEND A PHOTO",
+      "BACK TO THE PHOTO"};
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
     centeredText("RETERM ARCADE", 24, 4);
-    for (int entry = 0; entry < 3; ++entry) {
-      const int16_t y = 116 + entry * 84;
+    for (int entry = 0; entry < 4; ++entry) {
+      const int16_t y = 88 + entry * 76;
       if (entry == selected) {
-        display.fillRoundRect(150, y, 510, 64, 12, GxEPD_BLACK);
+        display.fillRoundRect(150, y, 510, 60, 12, GxEPD_BLACK);
         display.setTextColor(GxEPD_WHITE);
       } else {
-        display.drawRoundRect(150, y, 510, 64, 12, GxEPD_BLACK);
-        display.drawRoundRect(151, y + 1, 508, 62, 12, GxEPD_BLACK);
+        display.drawRoundRect(150, y, 510, 60, 12, GxEPD_BLACK);
+        display.drawRoundRect(151, y + 1, 508, 58, 12, GxEPD_BLACK);
       }
-      cellText(entries[entry], 405, y + 20, 3);
+      cellText(entries[entry], 405, y + 18, 3);
       display.setTextColor(GxEPD_BLACK);
-      if (entry == 0) drawScissorsIcon(110, y + 32, 52);
-      else if (entry == 1) drawSprite(kSpriteUnicorn, 84, y + 8, 3);
-      else drawSprite(kSpriteFrame, 86, y + 8, 3);
+      if (entry == 0) {
+        drawScissorsIcon(110, y + 30, 50);
+      } else if (entry == 1) {
+        drawSprite(kSpriteUnicorn, 88, y + 6, 3);
+      } else if (entry == 2) {
+        // The photo frame with an up arrow: send a new photo to the frame.
+        drawSprite(kSpriteFrame, 86, y + 6, 3);
+        display.fillTriangle(110, y + 16, 98, y + 30, 122, y + 30, GxEPD_BLACK);
+        display.fillRect(106, y + 30, 9, 12, GxEPD_BLACK);
+      } else {
+        drawSprite(kSpriteFrame, 86, y + 6, 3);
+      }
     }
     centeredText("LEFT down    GREEN choose    RIGHT up", 436, 2);
   } while (display.nextPage());
 }
 
-void runArcade() {
-  Serial.println("White-button wake: arcade menu");
+reterm::MenuAction runArcade() {
+  Serial.println("Arcade menu");
   waitForButtonsReleased();
   int selected = 0;
   for (;;) {
     drawMenuScreen(selected);
-    const int button = waitForButton(kGameIdleMs);
+    const ButtonPress press = waitForPress(kGameIdleMs);
     waitForButtonsReleased();
-    if (button == kBtnLeft) {
-      selected = (selected + 1) % 3;
+    if (press.button == kBtnLeft) {
+      selected = (selected + 1) % 4;
       continue;
     }
-    if (button == kBtnRight) {
-      selected = (selected + 2) % 3;
+    if (press.button == kBtnRight) {
+      selected = (selected + 3) % 4;
       continue;
     }
-    if (button == kBtnGreen) {
+    if (press.button == kBtnGreen) {
       if (selected == 0) {
-        // RPS leaves its result screen up; a wall-mode pet reclaims the
-        // panel on the next timer wake.
-        playRockPaperScissors();
-        return;
+        // A green hold in the game returns here; RPS otherwise leaves its
+        // result screen up and a wall-mode pet reclaims the panel on the
+        // next timer wake.
+        if (playRockPaperScissors()) continue;
+        return reterm::MenuAction::Sleep;
       }
       if (selected == 1) {
-        if (runPetScreen()) continue;  // green: back to the menu
-        return;                        // idle: pet stays on the wall
+        if (runPetScreen()) continue;      // green: back to the menu
+        return reterm::MenuAction::Sleep;  // idle: pet stays on the wall
+      }
+      if (selected == 2) {
+        Serial.println("Menu: upload session requested");
+        return reterm::MenuAction::UploadSession;
       }
       PetState pet = loadPet();
       if (pet.onWall) {
@@ -918,16 +960,21 @@ void runArcade() {
       }
       if (!restoreSavedPhoto())
         Serial.println("No saved image available to restore");
-      return;
+      return reterm::MenuAction::Sleep;
     }
     // Menu idle: never leave the menu as wallpaper.
     const PetState pet = loadPet();
     if (pet.adopted && pet.onWall) drawPetScreen(pet);
     else if (!restoreSavedPhoto())
       Serial.println("No saved image available to restore");
-    return;
+    return reterm::MenuAction::Sleep;
   }
 }
+
+// Wake classification, filled in by setup() before reterm::run() starts.
+bool g_wantSessionFromMenu = false;  // the pre-run menu chose SEND A PHOTO
+bool g_suppressButtonWake = false;   // a green hold already ran the menu
+bool g_wifiResetHold = false;        // green held five seconds through wake
 
 class E1001Board final : public reterm::Board {
  public:
@@ -951,22 +998,32 @@ class E1001Board final : public reterm::Board {
   }
   void drawUploadScreen(const String &url) override { drawUploadQr(url); }
   bool wokeByButton() const override {
+    if (g_suppressButtonWake) return false;
+    if (g_wantSessionFromMenu) return true;
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) return true;
     for (int pin : kButtonPins) {
       if (digitalRead(pin) == LOW) return true;
     }
     return false;
   }
-  bool wakeHoldRequestsWifiReset() override {
-    // Keep holding the green button for five seconds through the wake to
-    // forget the saved network. A normal tap releases within the first poll.
-    const uint32_t deadline = millis() + 5000;
-    while (digitalRead(kGreenButton) == LOW) {
-      if (int32_t(deadline - millis()) <= 0) return true;
-      delay(20);
+  // setup() measures the green hold once at wake; answer from that.
+  bool wakeHoldRequestsWifiReset() override { return g_wifiResetHold; }
+  // Holding green for about a second while the device is awake (upload
+  // session or provisioning portal) opens the arcade. Non-blocking: the
+  // runtime polls this from its wait loops.
+  bool menuRequested() override {
+    if (digitalRead(kGreenButton) == LOW) {
+      if (menuHoldSince_ == 0) menuHoldSince_ = millis();
+      else if (millis() - menuHoldSince_ >= kLongPressMs) {
+        menuHoldSince_ = 0;
+        return true;
+      }
+    } else {
+      menuHoldSince_ = 0;
     }
     return false;
   }
+  reterm::MenuAction onMenu() override { return runArcade(); }
   void prepareSleep() override {
     pinMode(kGreenButton, INPUT_PULLUP);
     esp_sleep_enable_ext0_wakeup(kGreenButton, 0);
@@ -978,6 +1035,9 @@ class E1001Board final : public reterm::Board {
     rtc_gpio_pullup_en(gpio_num_t(kRightButton));
     rtc_gpio_pulldown_dis(gpio_num_t(kRightButton));
   }
+
+ private:
+  uint32_t menuHoldSince_ = 0;
 };
 
 E1001Board board;
@@ -996,12 +1056,32 @@ void setup() {
   for (int pin : kButtonPins) pinMode(pin, INPUT_PULLUP);
   // Board-side hooks run before the shared runtime: a timer wake ages the
   // tamagotchi (and repaints its wall screen), a white-button wake opens the
-  // arcade. Both fall through into run() with the buttons released, so it
-  // takes its normal path — check-in on timer wakes, the no-command
-  // hibernate-and-sleep otherwise.
+  // arcade, and the green wake is classified by hold length. All paths fall
+  // through into run(), which sees the flags via wokeByButton() /
+  // wakeHoldRequestsWifiReset() and otherwise takes its normal course.
   const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
   if (wakeCause == ESP_SLEEP_WAKEUP_TIMER) petTimerTick();
-  if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) runArcade();
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+    if (runArcade() == reterm::MenuAction::UploadSession)
+      g_wantSessionFromMenu = true;
+  }
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT0) {
+    // Classify the green press: a tap keeps today's photo session, about a
+    // second of holding opens the arcade, five seconds still forgets the
+    // saved Wi-Fi network.
+    const uint32_t pressedAt = millis();
+    while (digitalRead(kGreenButton) == LOW && millis() - pressedAt < 5000)
+      delay(20);
+    const uint32_t held = millis() - pressedAt;
+    if (held >= 5000) {
+      g_wifiResetHold = true;
+    } else if (held >= kLongPressMs) {
+      if (runArcade() == reterm::MenuAction::UploadSession)
+        g_wantSessionFromMenu = true;
+      else
+        g_suppressButtonWake = true;
+    }
+  }
   reterm::run(board);
 }
 

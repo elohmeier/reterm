@@ -78,6 +78,9 @@ volatile bool httpTaskRunning = false;
 volatile bool acceptingImages = false;
 volatile bool uploadResponseSent = false;
 volatile uint32_t sessionLastActivity = 0;
+// Set when an awake wait loop saw Board::menuRequested(); the session (or
+// portal) tears down cleanly and run() opens the board's menu afterwards.
+bool g_menuInterrupt = false;
 
 // The shell only mounts the Pages-hosted editor. device-boot.js is a stable,
 // unhashed loader regenerated on every site deploy; it injects the current
@@ -808,6 +811,11 @@ bool provisionWifi() {
 
   const uint32_t deadline = millis() + 180000;
   while (!saved && int32_t(deadline - millis()) > 0) {
+    if (g_board->menuRequested()) {
+      Serial.println("Menu requested; closing the provisioning portal");
+      g_menuInterrupt = true;
+      break;
+    }
     dns.processNextRequest();
     provisioning.handleClient();
     delay(2);
@@ -830,6 +838,7 @@ void runUploadSession() {
   const bool wifiStarted = beginSavedWifi();
   const uint32_t wifiStartedAt = millis();
   if ((!wifiStarted || !waitForWifi(20000)) && !provisionWifi()) {
+    if (g_menuInterrupt) return;  // the menu repaints; skip the restore
     Serial.println("Wi-Fi connection/provisioning failed");
     // The panel still shows the dead provisioning screen; bring back the last
     // complete image like the session-timeout paths do.
@@ -866,6 +875,11 @@ void runUploadSession() {
   while (!uploadResponseSent && !otaResponseSent &&
          millis() - sessionLastActivity < kUploadWindowMs &&
          millis() - sessionStarted < kUploadAbsoluteMaxMs) {
+    if (g_board->menuRequested()) {
+      Serial.println("Menu requested; closing the upload session");
+      g_menuInterrupt = true;
+      break;
+    }
     if (WiFi.status() != WL_CONNECTED &&
         millis() - lastReconnectAttempt >= 2000) {
       lastReconnectAttempt = millis();
@@ -899,9 +913,23 @@ void runUploadSession() {
     g_board->refresh();
     g_board->hibernate();
     Serial.println("HTTP image displayed");
+  } else if (g_menuInterrupt) {
+    // The board's menu repaints the panel next; just drop any partial body.
+    abortPendingImage();
   } else {
     Serial.println("Upload timed out");
     if (!restoreSavedImage()) Serial.println("No saved image available to restore");
+  }
+}
+
+// Runs an upload session, then services any menu request that interrupted it
+// (or that a wait loop recorded on the way). The board's menu may chain
+// straight into another session — e.g. a "send a photo" entry — repeatedly.
+void runSessionAndMenu() {
+  runUploadSession();
+  while (g_menuInterrupt) {
+    g_menuInterrupt = false;
+    if (g_board->onMenu() == MenuAction::UploadSession) runUploadSession();
   }
 }
 
@@ -1308,7 +1336,7 @@ void run(Board &board) {
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
     Serial.println("Timer wake: Home Assistant check-in");
     if (runHaCheckin(true)) {
-      runUploadSession();
+      runSessionAndMenu();
     } else if (!g_panelHibernated) {
       // setup() reset the panel controller; park it again like the
       // no-command path so it does not draw standby current through sleep.
@@ -1328,7 +1356,7 @@ void run(Board &board) {
       buttonWake ? StartupCommand::None : receiveStartupCommand();
   if (command == StartupCommand::Image) goToSleep();
   if (command == StartupCommand::Web || buttonWake) {
-    runUploadSession();
+    runSessionAndMenu();
     // Wi-Fi is usually still associated here, so the extra state publish is
     // nearly free. Session commands are refused: one session per wake.
     runHaCheckin(false);

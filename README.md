@@ -86,10 +86,15 @@ during an open session; the next wake shows the captive portal again.
 
 ## E1001 arcade
 
-Waking the E1001 with either white top button opens a small on-device menu
-(left/right moves the selection, green chooses): rock paper scissors against
-the hardware RNG, Luna — a slow unicorn tamagotchi — and a shortcut back to
-the last photo. Luna ages with the Home Assistant timer wakes (one interval
+The arcade menu is always one gesture away: wake the E1001 with either white
+top button, or hold the green button for about a second — from sleep, from a
+game, or while a QR upload session or the provisioning portal is on screen
+(the session closes cleanly and the menu opens instead). A green tap still
+starts the photo session directly, and holding green for five seconds
+through a wake still forgets the saved Wi-Fi. The menu (left/right moves the
+selection, green chooses) offers rock paper scissors against the hardware
+RNG, Luna — a slow unicorn tamagotchi — a "send a photo" entry that starts
+an upload session, and a shortcut back to the last photo. Luna ages with the Home Assistant timer wakes (one interval
 per check-in), hatches after eight hours, and grows through foal, unicorn,
 and celestial stages; the white buttons feed her and play with her, and two
 days of starvation send her off in a whirlwind until a new egg is adopted.

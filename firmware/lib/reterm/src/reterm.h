@@ -28,6 +28,9 @@ struct Geometry {
   size_t imageBytes() const { return rowBytes * size_t(height); }
 };
 
+// What the board's menu wants after it closes.
+enum class MenuAction { Sleep, UploadSession };
+
 class Board {
  public:
   virtual ~Board() = default;
@@ -44,6 +47,16 @@ class Board {
 
   virtual void drawProvisionScreen(const String &ssid, const String &password) = 0;
   virtual void drawUploadScreen(const String &url) = 0;
+
+  // Polled from the runtime's awake wait loops (upload session, provisioning
+  // portal). Return true to close the current mode cleanly and open the
+  // board's menu; the implementation must be non-blocking and cheap. Boards
+  // without an on-device menu keep the defaults.
+  virtual bool menuRequested() { return false; }
+  // Runs the board's menu after a mode closed for it. Returning
+  // UploadSession starts a fresh upload session; the menu may be reopened
+  // from that session again any number of times.
+  virtual MenuAction onMenu() { return MenuAction::Sleep; }
 
   // True when this boot was caused by the board's wake control.
   virtual bool wokeByButton() const = 0;
