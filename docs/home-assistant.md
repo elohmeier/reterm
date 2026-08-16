@@ -15,10 +15,15 @@ settings:
 ```sh
 curl -X POST "http://<device-ip>/api/config" \
   -H "X-Upload-Token: <token from the QR URL>" \
-  -d mqtt_host=homehub.hf40.de -d mqtt_port=1883 \
+  -d mqtt_host=192.168.20.5 -d mqtt_port=1883 \
   -d mqtt_user=reterm -d mqtt_password=... \
   -d wake_interval_min=60
 ```
+
+In the hf40 network the frames live on the IoT VLAN (Skynet) and use the
+broker's direct listener on `192.168.20.5` — same-segment L2, no firewall in
+the path. `homehub.hf40.de` (192.168.10.5) also works from any VLAN but
+crosses OPNsense and depends on homehub's source policy routing.
 
 Only supplied fields change; `GET /api/config` returns the current values
 (password masked). Setting `mqtt_host` without a stored interval enables the
