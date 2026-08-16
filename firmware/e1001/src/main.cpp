@@ -6,6 +6,7 @@
 #include <SPI.h>
 #include <GxEPD2_BW.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
 #include <driver/rtc_io.h>
 #include <esp_random.h>
 #include <esp_sleep.h>
@@ -320,10 +321,16 @@ void drawResultScreen(int player, int machine, int diff,
   } while (display.nextPage());
 }
 
-int pressedMove() {
-  if (digitalRead(kLeftButton) == LOW) return 0;
-  if (digitalRead(kGreenButton) == LOW) return 1;
-  if (digitalRead(kRightButton) == LOW) return 2;
+// Button indices in physical order; the RPS move mapping (rock/paper/
+// scissors) is the same order, so games can use these values directly.
+constexpr int kBtnLeft = 0;
+constexpr int kBtnGreen = 1;
+constexpr int kBtnRight = 2;
+
+int readButton() {
+  if (digitalRead(kLeftButton) == LOW) return kBtnLeft;
+  if (digitalRead(kGreenButton) == LOW) return kBtnGreen;
+  if (digitalRead(kRightButton) == LOW) return kBtnRight;
   return -1;
 }
 
@@ -334,19 +341,19 @@ void waitForButtonsReleased() {
   const uint32_t deadline = millis() + 10000;
   uint32_t stableSince = millis();
   while (int32_t(deadline - millis()) > 0) {
-    if (pressedMove() >= 0) stableSince = millis();
+    if (readButton() >= 0) stableSince = millis();
     else if (millis() - stableSince >= 60) return;
     delay(10);
   }
 }
 
-int waitForMove(uint32_t timeoutMs) {
+int waitForButton(uint32_t timeoutMs) {
   const uint32_t deadline = millis() + timeoutMs;
   while (int32_t(deadline - millis()) > 0) {
-    const int move = pressedMove();
-    if (move >= 0) {
+    const int button = readButton();
+    if (button >= 0) {
       delay(30);  // debounce: accept only if the same press is still down
-      if (pressedMove() == move) return move;
+      if (readButton() == button) return button;
     }
     delay(10);
   }
@@ -354,12 +361,12 @@ int waitForMove(uint32_t timeoutMs) {
 }
 
 void playRockPaperScissors() {
-  Serial.println("White-button wake: rock paper scissors");
+  Serial.println("Arcade: rock paper scissors");
   RpsScore score = loadRpsScore();
   waitForButtonsReleased();
   drawChoiceScreen(score);
-  for (int player = waitForMove(kGameIdleMs); player >= 0;
-       player = waitForMove(kGameIdleMs)) {
+  for (int player = waitForButton(kGameIdleMs); player >= 0;
+       player = waitForButton(kGameIdleMs)) {
     const int machine = int(esp_random() % 3);
     const int diff = (player - machine + 3) % 3;
     if (diff == 1) ++score.wins;
@@ -379,6 +386,547 @@ void playRockPaperScissors() {
   // re-arms every wake source through its no-command path.
   Serial.println("Game idle; handing back to the standard flow");
   waitForButtonsReleased();
+}
+
+// --- Arcade sprites --------------------------------------------------------
+// 1-bit string art ('X' black cell, 'o' white cell, '.' transparent),
+// converted from CC0 pixel art: horse, unicorn (horn extended two cells), and
+// tornado from Clint Bellanger's "Tiny Creatures"
+// (https://opengameart.org/content/tiny-creatures, CC0); heart, apple,
+// sparkle, and frame from Kenney's "1-Bit Pack" (https://kenney.nl, CC0).
+// The egg is drawn to match. Regenerate with a light/dark threshold over the
+// creature mask plus a dilated single-cell outline.
+
+constexpr const char *kSpriteHorse[] = {
+    "........XXXXXX",
+    ".......XXoXXoX",
+    "......XXXooooX",
+    ".XXXXXXXXXooXX",
+    "XXXoooXXXooooX",
+    "XXoooooooXooXX",
+    "XXoooooooXooXX",
+    "XXooooooooXXXX",
+    ".XXooXXXooXXoX",
+    ".XooXXXXoXXooX",
+    ".XooXXXooXXXoX",
+    ".XXooXXooXXXXX",
+    "..XXXXXXXXXXXX",
+};
+
+constexpr const char *kSpriteUnicorn[] = {
+    ".............XX",
+    "............XX.",
+    "..........XXX..",
+    "........XXXoXX.",
+    ".......XXoXooX.",
+    "......XXXooooX.",
+    ".XXXXXXXXXooXX.",
+    "XXXoooXXXooooX.",
+    "XXooooooooooXX.",
+    "XXooooooooooXX.",
+    "XXooooooooXXoX.",
+    ".XoooooooooooX.",
+    ".XooooXXooXooX.",
+    ".XooooXooXXXoX.",
+    ".XXooXXooXXXXX.",
+    "..XXXXXXXXXXXX.",
+};
+
+constexpr const char *kSpriteTornado[] = {
+    "..XXXXXXXXXX..",
+    ".XXooooooooXX.",
+    "XXooooooooooXX",
+    "XooooooooooooX",
+    "XooooooooooooX",
+    "XooooooooooooX",
+    "XXoooXXoooXoXX",
+    ".XoooXXoooXoX.",
+    ".XXoooooooooX.",
+    "..XoooooooooX.",
+    "..XXoooooooXX.",
+    "..XoooooooooX.",
+    "..XoooooooooX.",
+    "..XXXoooooXXX.",
+    "....XooooXX...",
+};
+
+constexpr const char *kSpriteHeart[] = {
+    ".XX....XX.",
+    "XXXX..XXXX",
+    "XXXXXXXXXX",
+    "XXXXXXXXXX",
+    ".XXXXXXXX.",
+    "..XXXXXX..",
+    "...XXXX...",
+    "....XX....",
+};
+
+constexpr const char *kSpriteApple[] = {
+    "......XX..",
+    ".....XXX..",
+    ".....X....",
+    ".XXX..XXX.",
+    "XXXXXXXXXX",
+    "XXXXXX..XX",
+    "XXXXXX..XX",
+    "XXXXXXXXXX",
+    "XXXXXXXXXX",
+    ".XXXXXXXX.",
+    ".XXXXXXXX.",
+    "..XX..XX..",
+};
+
+constexpr const char *kSpriteSparkle[] = {
+    ".......X..X..X",
+    "........X.X.X.",
+    "...X.X...XXX..",
+    "....X..XXX.XXX",
+    "...X.X...XXX..",
+    "........X.X.X.",
+    ".......X..X..X",
+    "X.X.X.........",
+    "..X......X.X..",
+    "XX.XX.....X...",
+    "..X......X.X..",
+    "X.X.X.........",
+};
+
+constexpr const char *kSpriteFrame[] = {
+    ".XXXXXXXXXXXXXX.",
+    "X..............X",
+    "X.XXXXXXXXXXXX.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.X..........X.X",
+    "X.XXXXXXXXXXXX.X",
+    "X..............X",
+    ".XXXXXXXXXXXXXX.",
+};
+
+constexpr const char *kSpriteEgg[] = {
+    "...XXXXXX...",
+    "..XXooooXX..",
+    ".XXooooooXX.",
+    ".XoooXooooX.",
+    "XoooXXXooooX",
+    "XooXXXXXoooX",
+    "XoooXXXooooX",
+    "XooooXoooooX",
+    "XooooooooooX",
+    ".XooooooooX.",
+    ".XXooooooXX.",
+    "..XXXXXXXX..",
+};
+
+void drawSpriteImpl(const char *const rows[], int count, int16_t x, int16_t y,
+                    int16_t scale) {
+  for (int j = 0; j < count; ++j) {
+    for (int i = 0; rows[j][i]; ++i) {
+      const char cell = rows[j][i];
+      if (cell == '.') continue;
+      display.fillRect(x + i * scale, y + j * scale, scale, scale,
+                       cell == 'X' ? GxEPD_BLACK : GxEPD_WHITE);
+    }
+  }
+}
+
+template <size_t N>
+void drawSprite(const char *const (&rows)[N], int16_t x, int16_t y,
+                int16_t scale) {
+  drawSpriteImpl(rows, int(N), x, y, scale);
+}
+
+// Centers the sprite on cx with its feet on the ground line.
+template <size_t N>
+void drawSpriteOnGround(const char *const (&rows)[N], int16_t cx,
+                        int16_t ground, int16_t scale) {
+  const int16_t width = int16_t(strlen(rows[0])) * scale;
+  drawSpriteImpl(rows, int(N), cx - width / 2, ground - int16_t(N) * scale,
+                 scale);
+}
+
+// --- Luna the unicorn ------------------------------------------------------
+// A slow tamagotchi living on the deep-sleep duty cycle. There is no wall
+// clock, so elapsed time is counted in Home Assistant timer wakes: each one
+// ages the pet by the configured interval. Care happens through the arcade
+// menu; leaving the pet on screen puts it "on the wall", where every timer
+// wake repaints it until a new photo replaces the saved SPIFFS image
+// (detected by checksum, so photos always win). Without a configured HA
+// broker there are no timer wakes and the pet simply pauses between visits.
+
+constexpr uint32_t kPetFedMaxMin = 2 * 24 * 60;    // a full belly lasts two days
+constexpr uint32_t kPetJoyMaxMin = 36 * 60;        // entertained for a day and a half
+constexpr uint32_t kPetFeedMin = 12 * 60;
+constexpr uint32_t kPetPlayMin = 9 * 60;
+constexpr uint32_t kPetLostAfterMin = 2 * 24 * 60; // starved this long: runs off
+constexpr uint32_t kPetHatchMin = 8 * 60;
+constexpr uint32_t kPetFoalUntilMin = 3 * 24 * 60;
+constexpr uint32_t kPetElderMin = 10 * 24 * 60;
+
+struct PetState {
+  bool adopted = false;
+  bool lost = false;
+  bool onWall = false;
+  uint32_t ageMin = 0;
+  uint32_t fedMin = kPetFedMaxMin;
+  uint32_t joyMin = kPetJoyMaxMin;
+  uint32_t starvedMin = 0;
+  uint32_t wallSum = 0;  // checksum of the saved image when wall mode began
+};
+
+enum class PetStage { Egg, Foal, Unicorn, Celestial, Gone };
+
+PetStage petStage(const PetState &pet) {
+  if (pet.lost) return PetStage::Gone;
+  if (pet.ageMin < kPetHatchMin) return PetStage::Egg;
+  if (pet.ageMin < kPetFoalUntilMin) return PetStage::Foal;
+  if (pet.ageMin < kPetElderMin) return PetStage::Unicorn;
+  return PetStage::Celestial;
+}
+
+PetState loadPet() {
+  PetState pet;
+  Preferences preferences;
+  if (preferences.begin("reterm-pet", true)) {
+    pet.adopted = preferences.getBool("adopted", false);
+    pet.lost = preferences.getBool("lost", false);
+    pet.onWall = preferences.getBool("wall", false);
+    pet.ageMin = preferences.getUInt("age", 0);
+    pet.fedMin = preferences.getUInt("fed", kPetFedMaxMin);
+    pet.joyMin = preferences.getUInt("joy", kPetJoyMaxMin);
+    pet.starvedMin = preferences.getUInt("starved", 0);
+    pet.wallSum = preferences.getUInt("wallsum", 0);
+    preferences.end();
+  }
+  return pet;
+}
+
+void savePet(const PetState &pet) {
+  Preferences preferences;
+  if (!preferences.begin("reterm-pet", false)) return;
+  preferences.putBool("adopted", pet.adopted);
+  preferences.putBool("lost", pet.lost);
+  preferences.putBool("wall", pet.onWall);
+  preferences.putUInt("age", pet.ageMin);
+  preferences.putUInt("fed", pet.fedMin);
+  preferences.putUInt("joy", pet.joyMin);
+  preferences.putUInt("starved", pet.starvedMin);
+  preferences.putUInt("wallsum", pet.wallSum);
+  preferences.end();
+}
+
+void agePet(PetState &pet, uint32_t minutes) {
+  if (!pet.adopted || pet.lost) return;
+  pet.ageMin += minutes;
+  if (pet.ageMin < kPetHatchMin) return;  // eggs need no care
+  pet.fedMin -= min(pet.fedMin, minutes);
+  pet.joyMin -= min(pet.joyMin, minutes);
+  if (pet.fedMin == 0) {
+    pet.starvedMin += minutes;
+    if (pet.starvedMin >= kPetLostAfterMin) {
+      pet.lost = true;
+      Serial.println("The pet starved too long and wandered off");
+    }
+  } else {
+    pet.starvedMin = 0;
+  }
+}
+
+// FNV-1a over the saved image; the lib owns these paths, but reading them is
+// safe and lets wall mode notice when a new photo arrived.
+uint32_t savedImageChecksum() {
+  if (!SPIFFS.begin(true)) return 0;
+  const char *path = SPIFFS.exists("/current-image.bin") ? "/current-image.bin"
+                                                         : "/previous-image.bin";
+  File file = SPIFFS.open(path, FILE_READ);
+  if (!file) return 0;
+  uint32_t hash = 2166136261u;
+  uint8_t buffer[256];
+  for (;;) {
+    const size_t got = file.read(buffer, sizeof(buffer));
+    if (got == 0) break;
+    for (size_t i = 0; i < got; ++i) hash = (hash ^ buffer[i]) * 16777619u;
+  }
+  file.close();
+  return hash;
+}
+
+// Board-side variant of the lib's restore: repaints the saved photo without
+// hibernating (run()'s no-command path parks the panel afterwards).
+bool restoreSavedPhoto() {
+  if (!SPIFFS.begin(true)) return false;
+  const char *path = SPIFFS.exists("/current-image.bin") ? "/current-image.bin"
+                                                         : "/previous-image.bin";
+  File file = SPIFFS.open(path, FILE_READ);
+  if (!file || file.size() != size_t(48000)) {
+    if (file) file.close();
+    return false;
+  }
+  uint8_t row[100];
+  for (int16_t y = 0; y < 480; ++y) {
+    if (file.read(row, sizeof(row)) != sizeof(row)) {
+      file.close();
+      return false;
+    }
+    display.epd2.writeNative(row, nullptr, 0, y, 800, 1);
+  }
+  file.close();
+  display.epd2.refresh(false);
+  Serial.println("Saved photo restored");
+  return true;
+}
+
+void drawPetScreen(const PetState &pet) {
+  const PetStage stage = petStage(pet);
+  const char *title = "LUNA THE UNICORN";
+  const char *stageName = "UNICORN";
+  const char *hints = "LEFT feed    GREEN menu    RIGHT play";
+  if (stage == PetStage::Egg) {
+    title = "A MYSTERIOUS EGG";
+    stageName = "EGG";
+    hints = "GREEN menu";
+  } else if (stage == PetStage::Foal) {
+    stageName = "FOAL";
+  } else if (stage == PetStage::Celestial) {
+    stageName = "CELESTIAL";
+  } else if (stage == PetStage::Gone) {
+    title = "LUNA IS GONE";
+    stageName = "GONE";
+    hints = "LEFT adopt a new egg    GREEN menu";
+  }
+  const int fedPct = int(pet.fedMin * 100 / kPetFedMaxMin);
+  const int joyPct = int(pet.joyMin * 100 / kPetJoyMaxMin);
+  const char *mood = "Luna is content";
+  if (pet.fedMin == 0) mood = "Luna is starving!";
+  else if (fedPct <= 25) mood = "Luna is hungry";
+  else if (joyPct <= 25) mood = "Luna is bored";
+  else if (fedPct >= 70 && joyPct >= 70) mood = "Luna sparkles with joy!";
+  const String age = String(pet.ageMin / 1440) + "d " +
+                     String((pet.ageMin % 1440) / 60) + "h";
+  const String hatch =
+      "Hatches in about " +
+      String((kPetHatchMin - min(kPetHatchMin, pet.ageMin) + 59) / 60) + " h";
+  const String fedLabel = String(fedPct) + "%";
+  const String joyLabel = String(joyPct) + "%";
+
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    centeredText(title, 14, 4);
+    display.fillRect(40, 386, 340, 3, GxEPD_BLACK);
+    switch (stage) {
+      case PetStage::Egg:
+        drawSpriteOnGround(kSpriteEgg, 210, 384, 16);
+        break;
+      case PetStage::Foal:
+        drawSpriteOnGround(kSpriteHorse, 210, 384, 17);
+        break;
+      case PetStage::Celestial:
+        drawSpriteOnGround(kSpriteUnicorn, 210, 384, 18);
+        drawSprite(kSpriteSparkle, 30, 110, 4);
+        drawSprite(kSpriteSparkle, 344, 140, 3);
+        drawSprite(kSpriteSparkle, 344, 300, 3);
+        break;
+      case PetStage::Gone:
+        drawSpriteOnGround(kSpriteTornado, 210, 384, 17);
+        break;
+      default:
+        drawSpriteOnGround(kSpriteUnicorn, 210, 384, 18);
+        break;
+    }
+    display.setTextSize(3);
+    display.setCursor(430, 100);
+    display.print("STAGE: ");
+    display.print(stageName);
+    display.setTextSize(2);
+    display.setCursor(430, 140);
+    display.print("AGE ");
+    display.print(age);
+    if (stage == PetStage::Egg) {
+      display.setCursor(430, 200);
+      display.print(hatch);
+      display.setCursor(430, 232);
+      display.print("Keep it cozy...");
+    } else if (stage == PetStage::Gone) {
+      display.setCursor(430, 200);
+      display.print("A whirlwind took Luna");
+      display.setCursor(430, 232);
+      display.print("away to the clouds.");
+    } else {
+      drawSprite(kSpriteApple, 430, 182, 4);
+      drawSprite(kSpriteHeart, 430, 254, 4);
+      for (int inset = 0; inset < 3; ++inset) {
+        display.drawRect(490 + inset, 186 + inset, 270 - 2 * inset,
+                         30 - 2 * inset, GxEPD_BLACK);
+        display.drawRect(490 + inset, 250 + inset, 270 - 2 * inset,
+                         30 - 2 * inset, GxEPD_BLACK);
+      }
+      display.fillRect(496, 192, (270 - 12) * fedPct / 100, 18, GxEPD_BLACK);
+      display.fillRect(496, 256, (270 - 12) * joyPct / 100, 18, GxEPD_BLACK);
+      display.setCursor(700, 224);
+      display.print(fedLabel);
+      display.setCursor(700, 288);
+      display.print(joyLabel);
+      display.setCursor(430, 330);
+      display.print(mood);
+    }
+    centeredText(hints, 446, 2);
+  } while (display.nextPage());
+}
+
+// Runs the pet screen. Returns true to go back to the menu; false when the
+// idle timeout fired, which leaves the pet on the wall.
+bool runPetScreen() {
+  PetState pet = loadPet();
+  if (!pet.adopted) {
+    pet.adopted = true;
+    savePet(pet);
+    Serial.println("Arcade: a mysterious egg was adopted");
+  }
+  for (;;) {
+    drawPetScreen(pet);
+    for (;;) {
+      const int button = waitForButton(kGameIdleMs);
+      if (button < 0) {
+        pet.onWall = true;
+        pet.wallSum = savedImageChecksum();
+        savePet(pet);
+        Serial.println("Pet idle; it stays on the wall");
+        return false;
+      }
+      waitForButtonsReleased();
+      if (button == kBtnGreen) return true;
+      const PetStage stage = petStage(pet);
+      if (stage == PetStage::Gone) {
+        if (button == kBtnLeft) {
+          pet = PetState();
+          pet.adopted = true;
+          break;
+        }
+      } else if (stage != PetStage::Egg) {
+        if (button == kBtnLeft) {
+          pet.fedMin = min(kPetFedMaxMin, pet.fedMin + kPetFeedMin);
+          pet.starvedMin = 0;
+          break;
+        }
+        if (button == kBtnRight) {
+          pet.joyMin = min(kPetJoyMaxMin, pet.joyMin + kPetPlayMin);
+          break;
+        }
+      }
+      // Ignored press (e.g. feeding the egg): keep waiting without a redraw.
+    }
+    savePet(pet);
+  }
+}
+
+// Called on every timer wake before the shared runtime runs the HA check-in:
+// ages the pet and repaints its wall screen while it still owns the wall.
+void petTimerTick() {
+  uint32_t wakeMinutes = 0;
+  Preferences ha;  // read-only peek at the shared runtime's interval setting
+  if (ha.begin("reterm-ha", true)) {
+    wakeMinutes = ha.getUInt("wake_min", 0);
+    ha.end();
+  }
+  if (wakeMinutes == 0) return;
+  PetState pet = loadPet();
+  if (!pet.adopted) return;
+  agePet(pet, wakeMinutes);
+  if (pet.onWall) {
+    if (savedImageChecksum() != pet.wallSum) {
+      pet.onWall = false;  // a new photo claimed the wall; let it win
+      Serial.println("Pet wall mode ended: the saved image changed");
+    } else {
+      Serial.println("Timer wake: repainting the pet on the wall");
+      drawPetScreen(pet);
+    }
+  }
+  savePet(pet);
+}
+
+// --- Arcade menu -----------------------------------------------------------
+
+void drawMenuScreen(int selected) {
+  static constexpr const char *entries[] = {
+      "ROCK PAPER SCISSORS", "LUNA THE UNICORN", "BACK TO THE PHOTO"};
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    centeredText("RETERM ARCADE", 24, 4);
+    for (int entry = 0; entry < 3; ++entry) {
+      const int16_t y = 116 + entry * 84;
+      if (entry == selected) {
+        display.fillRoundRect(150, y, 510, 64, 12, GxEPD_BLACK);
+        display.setTextColor(GxEPD_WHITE);
+      } else {
+        display.drawRoundRect(150, y, 510, 64, 12, GxEPD_BLACK);
+        display.drawRoundRect(151, y + 1, 508, 62, 12, GxEPD_BLACK);
+      }
+      cellText(entries[entry], 405, y + 20, 3);
+      display.setTextColor(GxEPD_BLACK);
+      if (entry == 0) drawScissorsIcon(110, y + 32, 52);
+      else if (entry == 1) drawSprite(kSpriteUnicorn, 84, y + 8, 3);
+      else drawSprite(kSpriteFrame, 86, y + 8, 3);
+    }
+    centeredText("LEFT down    GREEN choose    RIGHT up", 436, 2);
+  } while (display.nextPage());
+}
+
+void runArcade() {
+  Serial.println("White-button wake: arcade menu");
+  waitForButtonsReleased();
+  int selected = 0;
+  for (;;) {
+    drawMenuScreen(selected);
+    const int button = waitForButton(kGameIdleMs);
+    waitForButtonsReleased();
+    if (button == kBtnLeft) {
+      selected = (selected + 1) % 3;
+      continue;
+    }
+    if (button == kBtnRight) {
+      selected = (selected + 2) % 3;
+      continue;
+    }
+    if (button == kBtnGreen) {
+      if (selected == 0) {
+        // RPS leaves its result screen up; a wall-mode pet reclaims the
+        // panel on the next timer wake.
+        playRockPaperScissors();
+        return;
+      }
+      if (selected == 1) {
+        if (runPetScreen()) continue;  // green: back to the menu
+        return;                        // idle: pet stays on the wall
+      }
+      PetState pet = loadPet();
+      if (pet.onWall) {
+        pet.onWall = false;
+        savePet(pet);
+      }
+      if (!restoreSavedPhoto())
+        Serial.println("No saved image available to restore");
+      return;
+    }
+    // Menu idle: never leave the menu as wallpaper.
+    const PetState pet = loadPet();
+    if (pet.adopted && pet.onWall) drawPetScreen(pet);
+    else if (!restoreSavedPhoto())
+      Serial.println("No saved image available to restore");
+    return;
+  }
 }
 
 class E1001Board final : public reterm::Board {
@@ -422,11 +970,9 @@ class E1001Board final : public reterm::Board {
   void prepareSleep() override {
     pinMode(kGreenButton, INPUT_PULLUP);
     esp_sleep_enable_ext0_wakeup(kGreenButton, 0);
-    // Either white button wakes into the game. IDF 4.4 still names mode 0
-    // ALL_LOW, but on the S3 the hardware wakes when ANY masked pin goes low
-    // (IDF 5 renames it ESP_EXT1_WAKEUP_ANY_LOW). Hold the RTC pullups so the
+    // Either white button wakes into the arcade. Hold the RTC pullups so the
     // pins cannot float low once the digital domain powers down.
-    esp_sleep_enable_ext1_wakeup(kGameButtonMask, ESP_EXT1_WAKEUP_ALL_LOW);
+    esp_sleep_enable_ext1_wakeup(kGameButtonMask, ESP_EXT1_WAKEUP_ANY_LOW);
     rtc_gpio_pullup_en(gpio_num_t(kLeftButton));
     rtc_gpio_pulldown_dis(gpio_num_t(kLeftButton));
     rtc_gpio_pullup_en(gpio_num_t(kRightButton));
@@ -448,11 +994,14 @@ void setup() {
   display.setRotation(0);
 
   for (int pin : kButtonPins) pinMode(pin, INPUT_PULLUP);
-  // A white-button wake plays rock paper scissors first, then falls into the
-  // shared runtime: buttons are released by then, so run() takes its
-  // no-command path, which hibernates the panel and deep sleeps.
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1)
-    playRockPaperScissors();
+  // Board-side hooks run before the shared runtime: a timer wake ages the
+  // tamagotchi (and repaints its wall screen), a white-button wake opens the
+  // arcade. Both fall through into run() with the buttons released, so it
+  // takes its normal path — check-in on timer wakes, the no-command
+  // hibernate-and-sleep otherwise.
+  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  if (wakeCause == ESP_SLEEP_WAKEUP_TIMER) petTimerTick();
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) runArcade();
   reterm::run(board);
 }
 

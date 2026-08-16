@@ -84,6 +84,25 @@ To change networks later, hold the E1001's green button for five seconds
 through a wake, or call the authenticated `POST /api/wifi/forget` endpoint
 during an open session; the next wake shows the captive portal again.
 
+## E1001 arcade
+
+Waking the E1001 with either white top button opens a small on-device menu
+(left/right moves the selection, green chooses): rock paper scissors against
+the hardware RNG, Luna — a slow unicorn tamagotchi — and a shortcut back to
+the last photo. Luna ages with the Home Assistant timer wakes (one interval
+per check-in), hatches after eight hours, and grows through foal, unicorn,
+and celestial stages; the white buttons feed her and play with her, and two
+days of starvation send her off in a whirlwind until a new egg is adopted.
+Leaving her screen idle keeps her on the display, where each check-in
+repaints her current state — uploading a new photo always takes the wall
+back. Game scores and pet state persist in NVS across firmware updates.
+
+Pixel art: the unicorn, horse, and tornado come from Clint Bellanger's
+[Tiny Creatures](https://opengameart.org/content/tiny-creatures) (CC0); the
+heart, apple, sparkle, and frame icons from Kenney's
+[1-Bit Pack](https://kenney.nl/assets/1-bit-pack) (CC0). All are converted
+to 1-bit string art in `firmware/e1001/src/main.cpp`.
+
 ## Update firmware over Wi-Fi
 
 An open upload session also accepts a firmware image on
