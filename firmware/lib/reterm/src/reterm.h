@@ -48,6 +48,18 @@ class Board {
   virtual void drawProvisionScreen(const String &ssid, const String &password) = 0;
   virtual void drawUploadScreen(const String &url) = 0;
 
+  // Board-specific MQTT command extension: called for retained command
+  // actions the shared runtime does not know. Return true when handled; the
+  // runtime then acks, dedupes, and clears the retained command as usual and
+  // publishes `detail` (plain text, no quotes) in the event. Long-running
+  // handlers must call serviceNetwork() at least every ~30 s to keep the
+  // MQTT connection alive.
+  virtual bool handleCommand(const String &action, const String &payload,
+                             String &detail, void (*serviceNetwork)()) {
+    (void)action; (void)payload; (void)detail; (void)serviceNetwork;
+    return false;
+  }
+
   // Polled from the runtime's awake wait loops (upload session, provisioning
   // portal). Return true to close the current mode cleanly and open the
   // board's menu; the implementation must be non-blocking and cheap. Boards

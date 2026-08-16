@@ -4,9 +4,12 @@
 // rows (bit set = white, MSB is the leftmost pixel), 48,000 bytes per screen.
 #include <Arduino.h>
 #include <SPI.h>
+#include <ArduinoJson.h>
 #include <GxEPD2_BW.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
+#include <WiFi.h>
 #include <driver/rtc_io.h>
 #include <esp_random.h>
 #include <esp_sleep.h>
@@ -32,8 +35,44 @@ constexpr uint64_t kGameButtonMask =
     (1ULL << kLeftButton) | (1ULL << kRightButton);
 
 SPIClass epaperSpi(HSPI);
-GxEPD2_BW<GxEPD2_750_GDEY075T7, 160>
-    display(GxEPD2_750_GDEY075T7(kCs, kDc, kReset, kBusy));
+
+// Exposes the protected UC8179 command plumbing so the video player can run
+// encoder-supplied panel scripts (init, fast-LUT waveform, ghost cleanup)
+// and stream full frames without the driver's per-image windowing overhead.
+class VideoPanel final : public GxEPD2_750_GDEY075T7 {
+ public:
+  VideoPanel(int16_t cs, int16_t dc, int16_t rst, int16_t busy)
+      : GxEPD2_750_GDEY075T7(cs, dc, rst, busy) {}
+  // Script format: {cmd, len, data...}*. Power-on and refresh commands
+  // busy-wait automatically so scripts stay declarative.
+  void runScript(const uint8_t *script, size_t length) {
+    for (size_t i = 0; i + 2 <= length;) {
+      const uint8_t cmd = script[i++];
+      const uint8_t count = script[i++];
+      if (i + count > length) return;
+      _writeCommand(cmd);
+      for (uint8_t k = 0; k < count; ++k) _writeData(script[i + k]);
+      i += count;
+      if (cmd == 0x04) _waitWhileBusy("script power on", 300);
+      if (cmd == 0x12) _waitWhileBusy("script refresh", 5000);
+    }
+  }
+  void writeVideoFrame(const uint8_t *data, size_t length) {
+    _writeCommand(0x13);  // new data RAM; N2OCP copies it to old on refresh
+    _startTransfer();
+    for (size_t i = 0; i < length; ++i) _transfer(data[i]);
+    _endTransfer();
+  }
+  // Returns the measured busy time in milliseconds.
+  uint32_t refreshVideo(uint16_t timeoutMs) {
+    const uint32_t started = millis();
+    _writeCommand(0x12);
+    _waitWhileBusy(nullptr, timeoutMs);
+    return millis() - started;
+  }
+};
+
+GxEPD2_BW<VideoPanel, 160> display(VideoPanel(kCs, kDc, kReset, kBusy));
 
 // Center text drawn with the default 6x8 GFX font at the given size.
 void centeredText(const char *text, int16_t y, uint8_t size) {
@@ -48,6 +87,17 @@ void cellText(const char *text, int16_t cx, int16_t y, uint8_t size) {
   display.setTextSize(size);
   display.setCursor(cx - int16_t(strlen(text)) * 3 * size, y);
   display.print(text);
+}
+
+void drawMessageScreen(const char *line1, const char *line2) {
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    centeredText(line1, 200, 3);
+    centeredText(line2, 248, 2);
+  } while (display.nextPage());
 }
 
 void drawProvisionQr(const String &ssid, const String &password) {
@@ -881,40 +931,354 @@ void petTimerTick() {
   savePet(pet);
 }
 
+// --- Video player ----------------------------------------------------------
+// Plays an RTV1 stream (see tools/encode-video.py). The container carries
+// UC8179 panel scripts (full-refresh init, fast partial-update waveform,
+// scene-cut ghost cleanup), an optional buzzer note track, and 1bpp frames
+// delta-encoded as copy/literal runs, so playback behavior is tuned by
+// re-encoding — no reflash. Pacing decodes every frame (deltas chain) but
+// skips displaying when behind schedule; playback stats return through the
+// MQTT command event. The melody runs on its own task on the other core so
+// note timing survives the long SPI writes and busy waits.
+
+constexpr int kBuzzerPin = 45;
+
+struct VideoNote {
+  uint32_t tMs;
+  uint16_t freqHz;
+  uint16_t durMs;
+};
+
+struct BuzzerTrack {
+  VideoNote *notes;
+  uint16_t count;
+  uint32_t startMs;
+  volatile bool stop;
+  volatile bool done;
+};
+
+BuzzerTrack g_buzzer = {nullptr, 0, 0, false, true};
+
+void buzzerTask(void *) {
+  for (uint16_t i = 0; i < g_buzzer.count && !g_buzzer.stop; ++i) {
+    const VideoNote &note = g_buzzer.notes[i];
+    while (!g_buzzer.stop &&
+           int32_t(g_buzzer.startMs + note.tMs - millis()) > 0)
+      delay(5);
+    if (g_buzzer.stop) break;
+    ledcWriteTone(0, note.freqHz);
+    const uint32_t offAt = g_buzzer.startMs + note.tMs + note.durMs;
+    while (!g_buzzer.stop && int32_t(offAt - millis()) > 0) delay(5);
+    ledcWriteTone(0, 0);
+  }
+  ledcWriteTone(0, 0);
+  g_buzzer.done = true;
+  vTaskDelete(nullptr);
+}
+
+bool readExact(Stream &stream, uint8_t *out, size_t want, uint32_t &stalls) {
+  size_t got = 0;
+  uint32_t lastProgress = millis();
+  while (got < want) {
+    const size_t n = stream.readBytes(out + got, want - got);
+    if (n == 0) {
+      ++stalls;
+      if (millis() - lastProgress > 15000) return false;
+      delay(2);
+    } else {
+      got += n;
+      lastProgress = millis();
+    }
+  }
+  return true;
+}
+
+// Copy runs leave the previous frame's bytes in place; literal runs overwrite.
+bool decodeDelta(const uint8_t *payload, size_t length, uint8_t *frame,
+                 size_t frameLen) {
+  size_t pos = 0, out = 0;
+  while (pos + 2 <= length) {
+    const uint16_t token = payload[pos] | (uint16_t(payload[pos + 1]) << 8);
+    pos += 2;
+    const size_t run = token & 0x7FFF;
+    if (out + run > frameLen) return false;
+    if (token & 0x8000) {
+      if (pos + run > length) return false;
+      memcpy(frame + out, payload + pos, run);
+      pos += run;
+    }
+    out += run;
+  }
+  return out == frameLen && pos == length;
+}
+
+// The menu can start playback before the shared runtime brought Wi-Fi up;
+// read the same wificaptive credentials the runtime uses.
+bool connectVideoWifi() {
+  Preferences preferences;
+  if (!preferences.begin("wificaptive", true)) return false;
+  int index = preferences.getInt("wifi_last_index", 0);
+  if (index < 0 || index >= 5) index = 0;
+  const String ssid =
+      preferences.getString(("wifi_" + String(index) + "_ssid").c_str(), "");
+  const String password =
+      preferences.getString(("wifi_" + String(index) + "_pswd").c_str(), "");
+  preferences.end();
+  if (ssid.isEmpty()) return false;
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  const uint32_t deadline = millis() + 20000;
+  while (WiFi.status() != WL_CONNECTED && int32_t(deadline - millis()) > 0)
+    delay(100);
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
+  if (WiFi.status() != WL_CONNECTED && !connectVideoWifi()) {
+    detail = "wifi unavailable";
+    return false;
+  }
+  HTTPClient http;
+  if (!url.startsWith("http://") || !http.begin(url)) {
+    detail = "bad url";
+    return false;
+  }
+  http.setTimeout(15000);
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    detail = "http " + String(code);
+    http.end();
+    return false;
+  }
+  WiFiClient &stream = http.getStream();
+  stream.setTimeout(1000);
+  uint32_t stalls = 0;
+
+  uint8_t header[22];
+  if (!readExact(stream, header, sizeof(header), stalls) ||
+      memcmp(header, "RTV1", 4) != 0) {
+    detail = "bad header";
+    http.end();
+    return false;
+  }
+  const uint16_t width = header[4] | (header[5] << 8);
+  const uint16_t height = header[6] | (header[7] << 8);
+  const uint16_t intervalMs = header[8] | (header[9] << 8);
+  const uint16_t frameCount = header[10] | (header[11] << 8);
+  const uint16_t noteCount = header[12] | (header[13] << 8);
+  const uint8_t spiMhz = header[14];
+  const uint16_t busyTimeoutMs = uint16_t(header[15]) * 100;
+  const uint16_t initLen = header[16] | (header[17] << 8);
+  const uint16_t videoLen = header[18] | (header[19] << 8);
+  const uint16_t cleanupLen = header[20] | (header[21] << 8);
+  const size_t frameBytes = size_t(width / 8) * height;
+  if (width != 800 || height != 480 || frameCount == 0 || intervalMs == 0 ||
+      initLen > 2048 || videoLen > 2048 || cleanupLen > 2048) {
+    detail = "bad geometry";
+    http.end();
+    return false;
+  }
+
+  const size_t scriptBytes = size_t(initLen) + videoLen + cleanupLen;
+  uint8_t *scripts = (uint8_t *)malloc(scriptBytes);
+  VideoNote *notes =
+      noteCount ? (VideoNote *)malloc(sizeof(VideoNote) * noteCount) : nullptr;
+  uint8_t *frame = (uint8_t *)malloc(frameBytes);
+  uint8_t *payload = (uint8_t *)malloc(frameBytes + 128);
+  bool ok = scripts && frame && payload && (noteCount == 0 || notes);
+  if (ok) ok = readExact(stream, scripts, scriptBytes, stalls);
+  if (ok && noteCount) {
+    for (uint16_t i = 0; i < noteCount && ok; ++i) {
+      uint8_t raw[8];
+      ok = readExact(stream, raw, sizeof(raw), stalls);
+      notes[i].tMs = uint32_t(raw[0]) | (uint32_t(raw[1]) << 8) |
+                     (uint32_t(raw[2]) << 16) | (uint32_t(raw[3]) << 24);
+      notes[i].freqHz = raw[4] | (uint16_t(raw[5]) << 8);
+      notes[i].durMs = raw[6] | (uint16_t(raw[7]) << 8);
+    }
+  }
+  if (!ok) {
+    detail = scripts && frame && payload ? "short stream" : "no memory";
+    free(scripts);
+    free(notes);
+    free(frame);
+    free(payload);
+    http.end();
+    return false;
+  }
+  const uint8_t *initScript = scripts;
+  const uint8_t *videoScript = scripts + initLen;
+  const uint8_t *cleanupScript = scripts + initLen + videoLen;
+
+  Serial.print("Video: ");
+  Serial.print(frameCount);
+  Serial.print(" frames @ ");
+  Serial.print(intervalMs);
+  Serial.print(" ms, spi MHz = ");
+  Serial.println(spiMhz);
+
+  // Panel up: video SPI clock, full init from the stream, first frame with a
+  // stock full refresh (also seeds the controller's old-data RAM via N2OCP),
+  // then the fast video waveform.
+  display.epd2.selectSPI(epaperSpi, SPISettings(uint32_t(spiMhz) * 1000000UL,
+                                               MSBFIRST, SPI_MODE0));
+  display.init(115200);
+  display.setRotation(0);
+  display.epd2.runScript(initScript, initLen);
+
+  uint32_t shown = 0, skipped = 0, refreshMsSum = 0, refreshes = 0;
+  bool aborted = false;
+  memset(frame, 0xFF, frameBytes);
+  uint32_t t0 = 0;
+  uint32_t lastService = millis();
+  for (uint16_t i = 0; i < frameCount; ++i) {
+    uint8_t rawHeader[4];
+    if (!readExact(stream, rawHeader, sizeof(rawHeader), stalls)) break;
+    const uint32_t lenAndFlags = uint32_t(rawHeader[0]) |
+                                 (uint32_t(rawHeader[1]) << 8) |
+                                 (uint32_t(rawHeader[2]) << 16) |
+                                 (uint32_t(rawHeader[3]) << 24);
+    const size_t payloadLen = lenAndFlags & 0xFFFFFF;
+    const bool cleanup = (lenAndFlags >> 24) & 0x01;
+    if (payloadLen > frameBytes + 128) break;
+    if (!readExact(stream, payload, payloadLen, stalls)) break;
+    if (!decodeDelta(payload, payloadLen, frame, frameBytes)) break;
+
+    if (i == 0) {
+      display.epd2.writeVideoFrame(frame, frameBytes);
+      display.epd2.refreshVideo(2500);  // stock full refresh from initScript
+      display.epd2.runScript(videoScript, videoLen);
+      t0 = millis();
+      if (noteCount) {
+        g_buzzer.notes = notes;
+        g_buzzer.count = noteCount;
+        g_buzzer.startMs = t0;
+        g_buzzer.stop = false;
+        g_buzzer.done = false;
+        ledcSetup(0, 440, 10);
+        ledcAttachPin(kBuzzerPin, 0);
+        xTaskCreatePinnedToCore(buzzerTask, "buzzer", 2048, nullptr, 1,
+                                nullptr, 0);
+      }
+      shown = 1;
+      continue;
+    }
+
+    // Green held across two consecutive frames aborts playback.
+    if (digitalRead(kGreenButton) == LOW) {
+      delay(30);
+      if (digitalRead(kGreenButton) == LOW) {
+        aborted = true;
+        break;
+      }
+    }
+    if (serviceNetwork && millis() - lastService > 2000) {
+      serviceNetwork();
+      lastService = millis();
+    }
+
+    const uint32_t due = t0 + uint32_t(i) * intervalMs;
+    if (int32_t(millis() - (due + intervalMs)) > 0) {
+      ++skipped;  // behind schedule: the delta is applied, skip the panel
+      continue;
+    }
+    display.epd2.writeVideoFrame(frame, frameBytes);
+    if (cleanup) {
+      display.epd2.runScript(cleanupScript, cleanupLen);
+      display.epd2.refreshVideo(2500);
+      display.epd2.runScript(videoScript, videoLen);
+    } else {
+      refreshMsSum += display.epd2.refreshVideo(busyTimeoutMs);
+      ++refreshes;
+    }
+    ++shown;
+    while (int32_t(due - millis()) > 0) delay(2);
+  }
+
+  g_buzzer.stop = true;
+  for (uint32_t waitStart = millis();
+       !g_buzzer.done && millis() - waitStart < 1000;)
+    delay(10);
+  if (noteCount) {
+    ledcDetachPin(kBuzzerPin);
+    pinMode(kBuzzerPin, OUTPUT);
+    digitalWrite(kBuzzerPin, LOW);
+  }
+  http.end();
+  free(scripts);
+  free(notes);
+  free(frame);
+  free(payload);
+
+  // Back to normal panel operation: stock SPI clock, fresh init, and a full
+  // stock refresh via the photo restore (or a clear) to flush ghosting.
+  display.epd2.selectSPI(epaperSpi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  display.init(115200);
+  display.setRotation(0);
+  if (!restoreSavedPhoto()) display.clearScreen();
+
+  const uint32_t avgRefresh = refreshes ? refreshMsSum / refreshes : 0;
+  detail = "shown=" + String(shown) + " skipped=" + String(skipped) +
+           " stalls=" + String(stalls) + " avg_refresh_ms=" +
+           String(avgRefresh) + (aborted ? " aborted=1" : "");
+  Serial.print("Video done: ");
+  Serial.println(detail);
+  return shown > 1;
+}
+
+// Replays the last MQTT-delivered video URL from the menu. Returns false
+// when nothing is queued yet.
+bool playLastVideo() {
+  Preferences preferences;
+  String url;
+  if (preferences.begin("reterm-video", true)) {
+    url = preferences.getString("url", "");
+    preferences.end();
+  }
+  if (url.isEmpty()) return false;
+  String detail;
+  playVideo(url, detail, nullptr);
+  return true;
+}
+
 // --- Arcade menu -----------------------------------------------------------
 
 void drawMenuScreen(int selected) {
   static constexpr const char *entries[] = {
       "ROCK PAPER SCISSORS", "LUNA THE UNICORN", "SEND A PHOTO",
-      "BACK TO THE PHOTO"};
+      "BACK TO THE PHOTO", "BAD APPLE"};
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
-    centeredText("RETERM ARCADE", 24, 4);
-    for (int entry = 0; entry < 4; ++entry) {
-      const int16_t y = 88 + entry * 76;
+    centeredText("RETERM ARCADE", 20, 4);
+    for (int entry = 0; entry < 5; ++entry) {
+      const int16_t y = 78 + entry * 70;
       if (entry == selected) {
-        display.fillRoundRect(150, y, 510, 60, 12, GxEPD_BLACK);
+        display.fillRoundRect(150, y, 510, 58, 12, GxEPD_BLACK);
         display.setTextColor(GxEPD_WHITE);
       } else {
-        display.drawRoundRect(150, y, 510, 60, 12, GxEPD_BLACK);
-        display.drawRoundRect(151, y + 1, 508, 58, 12, GxEPD_BLACK);
+        display.drawRoundRect(150, y, 510, 58, 12, GxEPD_BLACK);
+        display.drawRoundRect(151, y + 1, 508, 56, 12, GxEPD_BLACK);
       }
-      cellText(entries[entry], 405, y + 18, 3);
+      cellText(entries[entry], 405, y + 17, 3);
       display.setTextColor(GxEPD_BLACK);
       if (entry == 0) {
-        drawScissorsIcon(110, y + 30, 50);
+        drawScissorsIcon(110, y + 29, 48);
       } else if (entry == 1) {
-        drawSprite(kSpriteUnicorn, 88, y + 6, 3);
+        drawSprite(kSpriteUnicorn, 88, y + 5, 3);
       } else if (entry == 2) {
         // The photo frame with an up arrow: send a new photo to the frame.
-        drawSprite(kSpriteFrame, 86, y + 6, 3);
-        display.fillTriangle(110, y + 16, 98, y + 30, 122, y + 30, GxEPD_BLACK);
-        display.fillRect(106, y + 30, 9, 12, GxEPD_BLACK);
+        drawSprite(kSpriteFrame, 86, y + 5, 3);
+        display.fillTriangle(110, y + 15, 98, y + 29, 122, y + 29, GxEPD_BLACK);
+        display.fillRect(106, y + 29, 9, 12, GxEPD_BLACK);
+      } else if (entry == 3) {
+        drawSprite(kSpriteFrame, 86, y + 5, 3);
       } else {
-        drawSprite(kSpriteFrame, 86, y + 6, 3);
+        drawSprite(kSpriteApple, 90, y + 5, 4);
       }
     }
     centeredText("LEFT down    GREEN choose    RIGHT up", 436, 2);
@@ -930,11 +1294,11 @@ reterm::MenuAction runArcade() {
     const ButtonPress press = waitForPress(kGameIdleMs);
     waitForButtonsReleased();
     if (press.button == kBtnLeft) {
-      selected = (selected + 1) % 4;
+      selected = (selected + 1) % 5;
       continue;
     }
     if (press.button == kBtnRight) {
-      selected = (selected + 3) % 4;
+      selected = (selected + 4) % 5;
       continue;
     }
     if (press.button == kBtnGreen) {
@@ -952,6 +1316,13 @@ reterm::MenuAction runArcade() {
       if (selected == 2) {
         Serial.println("Menu: upload session requested");
         return reterm::MenuAction::UploadSession;
+      }
+      if (selected == 4) {
+        if (playLastVideo()) return reterm::MenuAction::Sleep;
+        drawMessageScreen("NO VIDEO QUEUED",
+                          "Send a video command over MQTT first");
+        delay(3000);
+        continue;
       }
       PetState pet = loadPet();
       if (pet.onWall) {
@@ -1024,6 +1395,29 @@ class E1001Board final : public reterm::Board {
     return false;
   }
   reterm::MenuAction onMenu() override { return runArcade(); }
+  bool handleCommand(const String &action, const String &payload,
+                     String &detail, void (*serviceNetwork)()) override {
+    if (action != "video") return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) {
+      detail = "bad json";
+      return true;
+    }
+    const String url = doc["url"] | "";
+    if (url.isEmpty()) {
+      detail = "missing url";
+      return true;
+    }
+    if (playVideo(url, detail, serviceNetwork)) {
+      // Remember the stream so the menu's BAD APPLE entry can replay it.
+      Preferences preferences;
+      if (preferences.begin("reterm-video", false)) {
+        preferences.putString("url", url);
+        preferences.end();
+      }
+    }
+    return true;
+  }
   void prepareSleep() override {
     pinMode(kGreenButton, INPUT_PULLUP);
     esp_sleep_enable_ext0_wakeup(kGreenButton, 0);

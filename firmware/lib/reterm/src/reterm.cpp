@@ -1213,6 +1213,20 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
     return CommandOutcome::SessionRequested;
   }
 
+  // Give the board a chance before rejecting: board-specific actions (e.g.
+  // the E1001 video player) live behind Board::handleCommand.
+  String detail;
+  if (g_board->handleCommand(action, payload, detail,
+                             [] { mqtt.loop(); })) {
+    if (commandId.length()) storeLastCommandId(commandId);
+    clearRetained(mqttCmdTopic);
+    detail.replace("\"", "'");
+    detail.replace("\\", "/");
+    publishEvent("{\"event\":\"" + action + "\",\"detail\":\"" + detail +
+                 "\",\"id\":\"" + commandId + "\"}");
+    return CommandOutcome::Handled;
+  }
+
   Serial.print("Ignoring unsupported MQTT command action: ");
   Serial.println(action);
   if (commandId.length()) storeLastCommandId(commandId);

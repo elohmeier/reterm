@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["imageio[pyav]>=2.34", "pillow>=11", "numpy>=1.26", "mido>=1.3"]
+# ///
+
+"""Encode a video into the RTV1 stream the E1001 video player consumes.
+
+The container carries everything the firmware needs so playback behavior can
+be tuned by re-encoding alone, without reflashing:
+
+- three UC8179 command scripts: init (full-refresh setup for the first
+  frame), video (the fast partial-update waveform, register LUTs with
+  configurable phase timings), and cleanup (ghost-flush refresh run at
+  scene cuts);
+- an optional monophonic buzzer note track extracted from a MIDI file;
+- 1bpp frames (bit set = white, MSB leftmost) delta-encoded against the
+  previous frame as copy/literal runs.
+
+Example:
+
+  ./tools/encode-video.py badapple.mp4 --fps 8 --waveform faster \\
+      --midi badapple.mid --midi-track 3 --output badapple.rtv
+
+The video and MIDI inputs stay out of the repository; only this tool is
+committed. Waveform phases are in panel frame periods; shorter phases mean
+faster refreshes, more ghosting, and less contrast — tune with the playback
+stats the firmware reports over MQTT.
+"""
+
+from __future__ import annotations
+
+import argparse
+import struct
+import sys
+from pathlib import Path
+
+import imageio.v3 as iio
+import numpy as np
+
+WIDTH, HEIGHT = 800, 480
+ROW_BYTES = WIDTH // 8
+
+WAVEFORMS = {
+    "balanced": (30, 5, 30, 5, 1),  # GxEPD2's proven register LUT
+    "fast": (15, 2, 15, 2, 1),
+    "faster": (8, 1, 8, 1, 1),
+    "insane": (4, 1, 4, 1, 1),
+}
+
+
+def script(*entries: tuple[int, bytes]) -> bytes:
+    out = bytearray()
+    for cmd, data in entries:
+        out += bytes((cmd, len(data))) + data
+    return bytes(out)
+
+
+def lut(level: int, t1: int, t2: int, t3: int, t4: int, repeat: int) -> bytes:
+    return bytes((level, t1, t2, t3, t4, repeat)).ljust(42, b"\x00")
+
+
+def build_scripts(phases: tuple[int, int, int, int, int]) -> tuple[bytes, bytes, bytes]:
+    t1, t2, t3, t4, rep = phases
+    init = script(
+        (0x00, b"\x1f"),                      # panel setting, OTP full LUT
+        (0x01, b"\x07\x07\x3f\x3f\x09"),      # power setting
+        (0x06, b"\x17\x17\x28\x17"),          # booster soft start
+        (0x61, struct.pack(">HH", WIDTH, HEIGHT)),
+        (0x15, b"\x00"),                      # DUSPI off
+        (0x50, b"\x29\x07"),                  # VCOM/CDI, N2OCP copy new->old
+        (0x60, b"\x22"),                      # TCON
+        (0xE3, b"\x22"),                      # PWS
+        (0xE0, b"\x02"),                      # CCSET: TSFIX
+        (0xE5, b"\x5a"),                      # fast full update (temp 90)
+        (0x04, b""),                          # power on (firmware busy-waits)
+    )
+    video = script(
+        (0x00, b"\x3f"),                      # partial update LUT from registers
+        (0x82, b"\x30"),                      # VCOM DC -2.5V
+        (0x50, b"\x39\x07"),                  # LUTBD, N2OCP
+        (0x20, lut(0x00, t1, t2, t3, t4, rep)),
+        (0x21, lut(0x00, t1, t2, t3, t4, rep)),
+        (0x22, lut(0x5A, t1, t2, t3, t4, rep)),  # black -> white
+        (0x23, lut(0x84, t1, t2, t3, t4, rep)),  # white -> black
+        (0x24, lut(0x00, t1, t2, t3, t4, rep)),
+        (0x25, lut(0x00, t1, t2, t3, t4, rep)),
+    )
+    cleanup = script(
+        (0x00, b"\x1f"),                      # back to OTP full LUT
+        (0xE0, b"\x02"),
+        (0xE5, b"\x5a"),
+    )
+    return init, video, cleanup
+
+
+def pack_frame(gray: np.ndarray) -> bytes:
+    bits = (gray >= 128).astype(np.uint8)
+    return np.packbits(bits, axis=1).tobytes()
+
+
+def delta_encode(prev: bytes | None, cur: bytes) -> bytes:
+    out = bytearray()
+    n = len(cur)
+    i = 0
+    if prev is None:
+        while i < n:
+            run = min(0x7FFF, n - i)
+            out += struct.pack("<H", 0x8000 | run) + cur[i:i + run]
+            i += run
+        return bytes(out)
+    pv = np.frombuffer(prev, dtype=np.uint8)
+    cv = np.frombuffer(cur, dtype=np.uint8)
+    same = pv == cv
+    while i < n:
+        if same[i]:
+            j = i
+            while j < n and same[j]:
+                j += 1
+            run = j - i
+            while run > 0:
+                r = min(0x7FFF, run)
+                out += struct.pack("<H", r)
+                run -= r
+            i = j
+        else:
+            j = i
+            # Absorb short "same" gaps into literals: a 2-byte copy token for
+            # a 1-2 byte match is not worth breaking the literal run.
+            while j < n and (not same[j] or (j + 3 <= n and not same[j:j + 3].all())):
+                j += 1
+            run = j - i
+            while run > 0:
+                r = min(0x7FFF, run)
+                out += struct.pack("<H", 0x8000 | r) + cur[i:i + r]
+                i += r
+                run -= r
+            i = j
+    return bytes(out)
+
+
+def melody_from_midi(path: Path, track_index: int, limit_s: float) -> list[tuple[int, int, int]]:
+    import mido
+
+    mid = mido.MidiFile(str(path))
+    events = []  # (t_ms, note, on)
+    # MidiFile iteration applies tempo changes; filter to the wanted track's
+    # channels since the merged stream loses track identity.
+    t = 0.0
+    track = mid.tracks[track_index]
+    channels = {msg.channel for msg in track if hasattr(msg, "channel")}
+    for msg in mid:  # yields absolute-timed messages with tempo applied
+        t += msg.time
+        if t > limit_s:
+            break
+        if msg.type in ("note_on", "note_off") and getattr(msg, "channel", None) in channels:
+            events.append((int(t * 1000), msg.note, msg.type == "note_on" and msg.velocity > 0))
+    notes = []  # (t_ms, freq, dur_ms)
+    active: tuple[int, int] | None = None  # (start_ms, note)
+    for t_ms, note, on in events:
+        if on:
+            if active is not None and note >= active[1]:
+                start, cur = active
+                if t_ms > start:
+                    notes.append((start, cur, t_ms - start))
+                active = (t_ms, note)
+            elif active is None:
+                active = (t_ms, note)
+        else:
+            if active is not None and active[1] == note:
+                start, cur = active
+                if t_ms > start:
+                    notes.append((start, cur, t_ms - start))
+                active = None
+    packed = []
+    for start, note, dur in notes:
+        freq = int(round(440.0 * 2 ** ((note - 69) / 12)))
+        packed.append((start, freq, min(dur, 0xFFFF)))
+    return packed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("video", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fps", type=float, default=8.0)
+    parser.add_argument("--seconds", type=float, default=0.0,
+                        help="encode only the first N seconds (0 = all)")
+    parser.add_argument("--start", type=float, default=0.0,
+                        help="skip the first N seconds of the source")
+    parser.add_argument("--waveform", default="faster",
+                        help="named preset (%s) or T1,T2,T3,T4,REP" %
+                             "/".join(WAVEFORMS))
+    parser.add_argument("--spi-mhz", type=int, default=10)
+    parser.add_argument("--busy-timeout-ms", type=int, default=3000)
+    parser.add_argument("--cleanup-change", type=float, default=0.5,
+                        help="changed-byte fraction that flags a scene-cut cleanup refresh")
+    parser.add_argument("--cleanup-every", type=float, default=20.0,
+                        help="force a cleanup refresh at least every N seconds")
+    parser.add_argument("--midi", type=Path)
+    parser.add_argument("--midi-track", type=int, default=3)
+    args = parser.parse_args()
+
+    if args.waveform in WAVEFORMS:
+        phases = WAVEFORMS[args.waveform]
+    else:
+        parts = tuple(int(p) for p in args.waveform.split(","))
+        if len(parts) != 5:
+            parser.error("--waveform needs a preset name or T1,T2,T3,T4,REP")
+        phases = parts
+    init_script, video_script, cleanup_script = build_scripts(phases)
+
+    meta = iio.immeta(args.video, plugin="pyav")
+    src_fps = meta.get("fps", 30.0)
+    interval_ms = int(round(1000.0 / args.fps))
+    step = max(1, int(round(src_fps / args.fps)))
+
+    frames = []
+    prev: bytes | None = None
+    last_cleanup_t = 0.0
+    raw_total = 0
+    for index, frame in enumerate(iio.imiter(args.video, plugin="pyav")):
+        t_src = index / src_fps
+        if t_src < args.start:
+            continue
+        if args.seconds and t_src - args.start > args.seconds:
+            break
+        if (index % step) != 0:
+            continue
+        from PIL import Image
+
+        im = Image.fromarray(frame).convert("L")
+        scale = HEIGHT / im.height
+        im = im.resize((int(round(im.width * scale)), HEIGHT))
+        canvas = Image.new("L", (WIDTH, HEIGHT), 255)
+        canvas.paste(im, ((WIDTH - im.width) // 2, 0))
+        cur = pack_frame(np.asarray(canvas))
+        payload = delta_encode(prev, cur)
+        raw_total += len(payload)
+        t_out = len(frames) * interval_ms / 1000.0
+        changed = 1.0 if prev is None else float(
+            np.count_nonzero(np.frombuffer(prev, np.uint8) !=
+                             np.frombuffer(cur, np.uint8))) / len(cur)
+        cleanup = False
+        if len(frames) > 0:
+            if changed >= args.cleanup_change and t_out - last_cleanup_t >= 2.0:
+                cleanup = True
+            elif t_out - last_cleanup_t >= args.cleanup_every:
+                cleanup = True
+        if cleanup:
+            last_cleanup_t = t_out
+        frames.append((cleanup, payload))
+        prev = cur
+    if not frames:
+        print("no frames encoded", file=sys.stderr)
+        return 1
+
+    duration_s = len(frames) * interval_ms / 1000.0
+    notes = []
+    if args.midi:
+        notes = melody_from_midi(args.midi, args.midi_track, duration_s)
+
+    with open(args.output, "wb") as f:
+        f.write(b"RTV1")
+        f.write(struct.pack("<HHHHHBB", WIDTH, HEIGHT, interval_ms,
+                            len(frames), len(notes), args.spi_mhz,
+                            min(255, args.busy_timeout_ms // 100)))
+        f.write(struct.pack("<HHH", len(init_script), len(video_script),
+                            len(cleanup_script)))
+        f.write(init_script + video_script + cleanup_script)
+        for t_ms, freq, dur in notes:
+            f.write(struct.pack("<IHH", t_ms, freq, dur))
+        for cleanup, payload in frames:
+            f.write(struct.pack("<I", len(payload) | (0x01000000 if cleanup else 0)))
+            f.write(payload)
+
+    total = args.output.stat().st_size
+    cleanups = sum(1 for c, _ in frames if c)
+    print(f"{len(frames)} frames @ {interval_ms} ms ({duration_s:.1f} s), "
+          f"{cleanups} cleanup refreshes, {len(notes)} notes, "
+          f"{total / 1e6:.2f} MB ({raw_total // max(1, len(frames))} B/frame avg), "
+          f"waveform {phases}, spi {args.spi_mhz} MHz")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
