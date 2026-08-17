@@ -74,6 +74,9 @@ def build_scripts(phases: tuple[int, int, int, int, int],
         (0xE3, b"\x22"),                      # PWS
         (0xE0, b"\x02"),                      # CCSET: TSFIX
         (0xE5, b"\x5a"),                      # fast full update (temp 90)
+        # PLL before power-on: the frame-rate register does not take effect
+        # when written on a powered panel.
+        *(((0x30, bytes((pll,))),) if pll is not None else ()),
         (0x04, b""),                          # power on (firmware busy-waits)
     )
     video = script(
@@ -88,10 +91,17 @@ def build_scripts(phases: tuple[int, int, int, int, int],
         (0x24, lut(0x00, t1, t2, t3, t4, rep)),
         (0x25, lut(0x00, t1, t2, t3, t4, rep)),
     )
+    # Ghost flush without leaving register-LUT mode: switching to the OTP
+    # LUTs mid-video leaves the resumed register mode degraded (~2.2 s
+    # refreshes), so the cleanup is simply the strong "balanced" register
+    # waveform; the firmware re-runs the video script right after.
     cleanup = script(
-        (0x00, b"\x1f"),                      # back to OTP full LUT
-        (0xE0, b"\x02"),
-        (0xE5, b"\x5a"),
+        (0x20, lut(0x00, 30, 5, 30, 5, 1)),
+        (0x21, lut(0x00, 30, 5, 30, 5, 1)),
+        (0x22, lut(0x5A, 30, 5, 30, 5, 1)),
+        (0x23, lut(0x84, 30, 5, 30, 5, 1)),
+        (0x24, lut(0x00, 30, 5, 30, 5, 1)),
+        (0x25, lut(0x00, 30, 5, 30, 5, 1)),
     )
     return init, video, cleanup
 
