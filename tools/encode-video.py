@@ -61,8 +61,14 @@ def lut(level: int, t1: int, t2: int, t3: int, t4: int, repeat: int) -> bytes:
 
 
 def build_scripts(phases: tuple[int, int, int, int, int],
-                  pll: int | None) -> tuple[bytes, bytes, bytes]:
+                  pll: int | None, drive: str) -> tuple[bytes, bytes, bytes]:
     t1, t2, t3, t4, rep = phases
+    # "balanced" keeps GxEPD2's pre-pulsed patterns (half the phases swing the
+    # wrong way as an activation pulse — good image, weak at short phases).
+    # "direct" drives every phase toward the target for double the effective
+    # push at the same refresh time; the DC imbalance is compensated by the
+    # balanced cleanup refreshes and the final full refresh.
+    kw_level, wk_level = (0xAA, 0x55) if drive == "direct" else (0x5A, 0x84)
     init = script(
         (0x00, b"\x1f"),                      # panel setting, OTP full LUT
         (0x01, b"\x07\x07\x3f\x3f\x09"),      # power setting
@@ -86,8 +92,8 @@ def build_scripts(phases: tuple[int, int, int, int, int],
         (0x50, b"\x39\x07"),                  # LUTBD, N2OCP
         (0x20, lut(0x00, t1, t2, t3, t4, rep)),
         (0x21, lut(0x00, t1, t2, t3, t4, rep)),
-        (0x22, lut(0x5A, t1, t2, t3, t4, rep)),  # black -> white
-        (0x23, lut(0x84, t1, t2, t3, t4, rep)),  # white -> black
+        (0x22, lut(kw_level, t1, t2, t3, t4, rep)),  # black -> white
+        (0x23, lut(wk_level, t1, t2, t3, t4, rep)),  # white -> black
         (0x24, lut(0x00, t1, t2, t3, t4, rep)),
         (0x25, lut(0x00, t1, t2, t3, t4, rep)),
     )
@@ -207,6 +213,11 @@ def main() -> int:
     parser.add_argument("--pll", type=lambda v: int(v, 16), default=None,
                         help="UC8179 PLL byte in hex (e.g. 3a = 100 Hz frame "
                              "rate); omitted = panel OTP default")
+    parser.add_argument("--drive", default="balanced",
+                        choices=("balanced", "direct"),
+                        help="video LUT polarity: balanced pre-pulse (best "
+                             "image) or direct all-phases-toward-target "
+                             "(double push per refresh, needs cleanups)")
     parser.add_argument("--redrive", type=int, default=2, choices=(0, 1, 2),
                         help="re-drive changed pixels for N extra frames by "
                              "spoofing the controller's old-data RAM; kills "
@@ -228,7 +239,7 @@ def main() -> int:
         if len(parts) != 5:
             parser.error("--waveform needs a preset name or T1,T2,T3,T4,REP")
         phases = parts
-    init_script, video_script, cleanup_script = build_scripts(phases, args.pll)
+    init_script, video_script, cleanup_script = build_scripts(phases, args.pll, args.drive)
 
     meta = iio.immeta(args.video, plugin="pyav")
     src_fps = meta.get("fps", 30.0)
