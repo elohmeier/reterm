@@ -60,7 +60,8 @@ def lut(level: int, t1: int, t2: int, t3: int, t4: int, repeat: int) -> bytes:
     return bytes((level, t1, t2, t3, t4, repeat)).ljust(42, b"\x00")
 
 
-def build_scripts(phases: tuple[int, int, int, int, int]) -> tuple[bytes, bytes, bytes]:
+def build_scripts(phases: tuple[int, int, int, int, int],
+                  pll: int | None) -> tuple[bytes, bytes, bytes]:
     t1, t2, t3, t4, rep = phases
     init = script(
         (0x00, b"\x1f"),                      # panel setting, OTP full LUT
@@ -77,6 +78,7 @@ def build_scripts(phases: tuple[int, int, int, int, int]) -> tuple[bytes, bytes,
     )
     video = script(
         (0x00, b"\x3f"),                      # partial update LUT from registers
+        *(((0x30, bytes((pll,))),) if pll is not None else ()),  # PLL frame rate
         (0x82, b"\x30"),                      # VCOM DC -2.5V
         (0x50, b"\x39\x07"),                  # LUTBD, N2OCP
         (0x20, lut(0x00, t1, t2, t3, t4, rep)),
@@ -192,6 +194,9 @@ def main() -> int:
                         help="named preset (%s) or T1,T2,T3,T4,REP" %
                              "/".join(WAVEFORMS))
     parser.add_argument("--spi-mhz", type=int, default=10)
+    parser.add_argument("--pll", type=lambda v: int(v, 16), default=None,
+                        help="UC8179 PLL byte in hex (e.g. 3a = 100 Hz frame "
+                             "rate); omitted = panel OTP default")
     parser.add_argument("--busy-timeout-ms", type=int, default=3000)
     parser.add_argument("--cleanup-change", type=float, default=0.5,
                         help="changed-byte fraction that flags a scene-cut cleanup refresh")
@@ -208,7 +213,7 @@ def main() -> int:
         if len(parts) != 5:
             parser.error("--waveform needs a preset name or T1,T2,T3,T4,REP")
         phases = parts
-    init_script, video_script, cleanup_script = build_scripts(phases)
+    init_script, video_script, cleanup_script = build_scripts(phases, args.pll)
 
     meta = iio.immeta(args.video, plugin="pyav")
     src_fps = meta.get("fps", 30.0)

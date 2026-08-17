@@ -60,7 +60,7 @@ class VideoPanel final : public GxEPD2_750_GDEY075T7 {
   void writeVideoFrame(const uint8_t *data, size_t length) {
     _writeCommand(0x13);  // new data RAM; N2OCP copies it to old on refresh
     _startTransfer();
-    for (size_t i = 0; i < length; ++i) _transfer(data[i]);
+    _pSPIx->writeBytes(data, length);
     _endTransfer();
   }
   // Returns the measured busy time in milliseconds.
@@ -69,6 +69,46 @@ class VideoPanel final : public GxEPD2_750_GDEY075T7 {
     _writeCommand(0x12);
     _waitWhileBusy(nullptr, timeoutMs);
     return millis() - started;
+  }
+  // Windowed variants: writing and driving only the dirty rows makes the
+  // refresh cost scale with the changed region's height instead of the
+  // whole panel — the key to video-rate partial updates on this hardware.
+  void writeVideoRows(const uint8_t *frame, uint16_t yStart, uint16_t rows) {
+    _writeCommand(0x91);  // partial in
+    setWindow(0, yStart, WIDTH, rows);
+    _writeCommand(0x13);
+    _startTransfer();
+    _pSPIx->writeBytes(frame + size_t(yStart) * (WIDTH / 8),
+                       size_t(rows) * (WIDTH / 8));
+    _endTransfer();
+    _writeCommand(0x92);  // partial out
+  }
+  uint32_t refreshRows(uint16_t yStart, uint16_t rows, uint16_t timeoutMs) {
+    const uint32_t started = millis();
+    _writeCommand(0x91);
+    setWindow(0, yStart, WIDTH, rows);
+    _writeCommand(0x12);
+    _waitWhileBusy(nullptr, timeoutMs);
+    _writeCommand(0x92);
+    return millis() - started;
+  }
+
+ private:
+  // Mirrors the driver's private _setPartialRamArea.
+  void setWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    const uint16_t xe = (x + w - 1) | 0x0007;
+    const uint16_t ye = y + h - 1;
+    x &= 0xFFF8;
+    _writeCommand(0x90);  // partial window
+    _writeData(x / 256);
+    _writeData(x % 256);
+    _writeData(xe / 256);
+    _writeData(xe % 256);
+    _writeData(y / 256);
+    _writeData(y % 256);
+    _writeData(ye / 256);
+    _writeData(ye % 256);
+    _writeData(0x01);
   }
 };
 
@@ -993,9 +1033,10 @@ bool readExact(Stream &stream, uint8_t *out, size_t want, uint32_t &stalls) {
   return true;
 }
 
-// Copy runs leave the previous frame's bytes in place; literal runs overwrite.
+// Copy runs leave the previous frame's bytes in place; literal runs
+// overwrite and extend the dirty range (byte indices into the frame).
 bool decodeDelta(const uint8_t *payload, size_t length, uint8_t *frame,
-                 size_t frameLen) {
+                 size_t frameLen, size_t &dirtyLo, size_t &dirtyHi) {
   size_t pos = 0, out = 0;
   while (pos + 2 <= length) {
     const uint16_t token = payload[pos] | (uint16_t(payload[pos + 1]) << 8);
@@ -1006,6 +1047,10 @@ bool decodeDelta(const uint8_t *payload, size_t length, uint8_t *frame,
       if (pos + run > length) return false;
       memcpy(frame + out, payload + pos, run);
       pos += run;
+      if (run) {
+        if (out < dirtyLo) dirtyLo = out;
+        if (out + run - 1 > dirtyHi) dirtyHi = out + run - 1;
+      }
     }
     out += run;
   }
@@ -1129,10 +1174,15 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   display.epd2.runScript(initScript, initLen);
 
   uint32_t shown = 0, skipped = 0, refreshMsSum = 0, refreshes = 0;
+  uint32_t rowsSum = 0;
   bool aborted = false;
   memset(frame, 0xFF, frameBytes);
   uint32_t t0 = 0;
   uint32_t lastService = millis();
+  // Union of undisplayed changes: skipped frames accumulate here so the next
+  // displayed frame's window covers everything the panel has not seen yet.
+  size_t dirtyLo = SIZE_MAX, dirtyHi = 0;
+  const size_t rowBytes = width / 8;
   for (uint16_t i = 0; i < frameCount; ++i) {
     uint8_t rawHeader[4];
     if (!readExact(stream, rawHeader, sizeof(rawHeader), stalls)) break;
@@ -1144,12 +1194,15 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     const bool cleanup = (lenAndFlags >> 24) & 0x01;
     if (payloadLen > frameBytes + 128) break;
     if (!readExact(stream, payload, payloadLen, stalls)) break;
-    if (!decodeDelta(payload, payloadLen, frame, frameBytes)) break;
+    if (!decodeDelta(payload, payloadLen, frame, frameBytes, dirtyLo, dirtyHi))
+      break;
 
     if (i == 0) {
       display.epd2.writeVideoFrame(frame, frameBytes);
       display.epd2.refreshVideo(2500);  // stock full refresh from initScript
       display.epd2.runScript(videoScript, videoLen);
+      dirtyLo = SIZE_MAX;
+      dirtyHi = 0;
       t0 = millis();
       if (noteCount) {
         g_buzzer.notes = notes;
@@ -1181,19 +1234,28 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
 
     const uint32_t due = t0 + uint32_t(i) * intervalMs;
     if (int32_t(millis() - (due + intervalMs)) > 0) {
-      ++skipped;  // behind schedule: the delta is applied, skip the panel
+      ++skipped;  // behind schedule: the delta is applied, the panel waits
       continue;
     }
-    display.epd2.writeVideoFrame(frame, frameBytes);
     if (cleanup) {
+      display.epd2.writeVideoFrame(frame, frameBytes);
       display.epd2.runScript(cleanupScript, cleanupLen);
       display.epd2.refreshVideo(2500);
       display.epd2.runScript(videoScript, videoLen);
-    } else {
-      refreshMsSum += display.epd2.refreshVideo(busyTimeoutMs);
+      ++shown;
+    } else if (dirtyLo <= dirtyHi) {
+      const uint16_t yStart = uint16_t(dirtyLo / rowBytes);
+      const uint16_t rows = uint16_t(dirtyHi / rowBytes) - yStart + 1;
+      display.epd2.writeVideoRows(frame, yStart, rows);
+      refreshMsSum += display.epd2.refreshRows(yStart, rows, busyTimeoutMs);
       ++refreshes;
+      rowsSum += rows;
+      ++shown;
+    } else {
+      ++shown;  // nothing changed on the panel this frame
     }
-    ++shown;
+    dirtyLo = SIZE_MAX;
+    dirtyHi = 0;
     while (int32_t(due - millis()) > 0) delay(2);
   }
 
@@ -1220,9 +1282,11 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   if (!restoreSavedPhoto()) display.clearScreen();
 
   const uint32_t avgRefresh = refreshes ? refreshMsSum / refreshes : 0;
+  const uint32_t avgRows = refreshes ? rowsSum / refreshes : 0;
   detail = "shown=" + String(shown) + " skipped=" + String(skipped) +
            " stalls=" + String(stalls) + " avg_refresh_ms=" +
-           String(avgRefresh) + (aborted ? " aborted=1" : "");
+           String(avgRefresh) + " avg_rows=" + String(avgRows) +
+           (aborted ? " aborted=1" : "");
   Serial.print("Video done: ");
   Serial.println(detail);
   return shown > 1;
