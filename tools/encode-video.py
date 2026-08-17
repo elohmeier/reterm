@@ -207,6 +207,11 @@ def main() -> int:
     parser.add_argument("--pll", type=lambda v: int(v, 16), default=None,
                         help="UC8179 PLL byte in hex (e.g. 3a = 100 Hz frame "
                              "rate); omitted = panel OTP default")
+    parser.add_argument("--redrive", type=int, default=2, choices=(0, 1, 2),
+                        help="re-drive changed pixels for N extra frames by "
+                             "spoofing the controller's old-data RAM; kills "
+                             "ghost trails at the cost of one extra windowed "
+                             "RAM write per frame")
     parser.add_argument("--busy-timeout-ms", type=int, default=3000)
     parser.add_argument("--cleanup-change", type=float, default=0.5,
                         help="changed-byte fraction that flags a scene-cut cleanup refresh")
@@ -277,9 +282,10 @@ def main() -> int:
 
     with open(args.output, "wb") as f:
         f.write(b"RTV1")
-        f.write(struct.pack("<HHHHHBB", WIDTH, HEIGHT, interval_ms,
+        f.write(struct.pack("<HHHHHBBB", WIDTH, HEIGHT, interval_ms,
                             len(frames), len(notes), args.spi_mhz,
-                            min(255, args.busy_timeout_ms // 100)))
+                            min(255, args.busy_timeout_ms // 100),
+                            args.redrive))
         f.write(struct.pack("<HHH", len(init_script), len(video_script),
                             len(cleanup_script)))
         f.write(init_script + video_script + cleanup_script)

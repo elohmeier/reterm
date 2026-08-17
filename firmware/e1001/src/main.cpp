@@ -70,16 +70,18 @@ class VideoPanel final : public GxEPD2_750_GDEY075T7 {
     _waitWhileBusy(nullptr, timeoutMs);
     return millis() - started;
   }
-  // Windowed variants: writing and driving only the dirty rows makes the
-  // refresh cost scale with the changed region's height instead of the
-  // whole panel — the key to video-rate partial updates on this hardware.
-  void writeVideoRows(const uint8_t *frame, uint16_t yStart, uint16_t rows) {
+  // Windowed variants: writing and driving only the dirty rows keeps the
+  // transfer cost proportional to the changed region. `command` selects the
+  // RAM plane: 0x13 = new data, 0x10 = old data — writing a spoofed old
+  // plane forces the next refresh to re-drive chosen pixels even when the
+  // new data did not change (the ghost-trail scrubber relies on this).
+  void writeVideoWindow(uint8_t command, const uint8_t *rowsData,
+                        uint16_t yStart, uint16_t rows) {
     _writeCommand(0x91);  // partial in
     setWindow(0, yStart, WIDTH, rows);
-    _writeCommand(0x13);
+    _writeCommand(command);
     _startTransfer();
-    _pSPIx->writeBytes(frame + size_t(yStart) * (WIDTH / 8),
-                       size_t(rows) * (WIDTH / 8));
+    _pSPIx->writeBytes(rowsData, size_t(rows) * (WIDTH / 8));
     _endTransfer();
     _writeCommand(0x92);  // partial out
   }
@@ -1034,9 +1036,11 @@ bool readExact(Stream &stream, uint8_t *out, size_t want, uint32_t &stalls) {
 }
 
 // Copy runs leave the previous frame's bytes in place; literal runs
-// overwrite and extend the dirty range (byte indices into the frame).
+// overwrite, extend the dirty range (byte indices into the frame), and mark
+// their bytes in the changed bitmap (one bit per frame byte).
 bool decodeDelta(const uint8_t *payload, size_t length, uint8_t *frame,
-                 size_t frameLen, size_t &dirtyLo, size_t &dirtyHi) {
+                 size_t frameLen, size_t &dirtyLo, size_t &dirtyHi,
+                 uint8_t *changedMap) {
   size_t pos = 0, out = 0;
   while (pos + 2 <= length) {
     const uint16_t token = payload[pos] | (uint16_t(payload[pos + 1]) << 8);
@@ -1050,6 +1054,10 @@ bool decodeDelta(const uint8_t *payload, size_t length, uint8_t *frame,
       if (run) {
         if (out < dirtyLo) dirtyLo = out;
         if (out + run - 1 > dirtyHi) dirtyHi = out + run - 1;
+        if (changedMap) {
+          for (size_t b = out; b < out + run; ++b)
+            changedMap[b >> 3] |= uint8_t(1) << (b & 7);
+        }
       }
     }
     out += run;
@@ -1101,7 +1109,7 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   stream.setTimeout(1000);
   uint32_t stalls = 0;
 
-  uint8_t header[22];
+  uint8_t header[23];
   if (!readExact(stream, header, sizeof(header), stalls) ||
       memcmp(header, "RTV1", 4) != 0) {
     detail = "bad header";
@@ -1115,9 +1123,10 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   const uint16_t noteCount = header[12] | (header[13] << 8);
   const uint8_t spiMhz = header[14];
   const uint16_t busyTimeoutMs = uint16_t(header[15]) * 100;
-  const uint16_t initLen = header[16] | (header[17] << 8);
-  const uint16_t videoLen = header[18] | (header[19] << 8);
-  const uint16_t cleanupLen = header[20] | (header[21] << 8);
+  const uint8_t redrive = header[16] > 2 ? 2 : header[16];
+  const uint16_t initLen = header[17] | (header[18] << 8);
+  const uint16_t videoLen = header[19] | (header[20] << 8);
+  const uint16_t cleanupLen = header[21] | (header[22] << 8);
   const size_t frameBytes = size_t(width / 8) * height;
   if (width != 800 || height != 480 || frameCount == 0 || intervalMs == 0 ||
       initLen > 2048 || videoLen > 2048 || cleanupLen > 2048) {
@@ -1127,12 +1136,21 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   }
 
   const size_t scriptBytes = size_t(initLen) + videoLen + cleanupLen;
+  const size_t mapBytes = frameBytes / 8;  // one bit per frame byte
   uint8_t *scripts = (uint8_t *)malloc(scriptBytes);
   VideoNote *notes =
       noteCount ? (VideoNote *)malloc(sizeof(VideoNote) * noteCount) : nullptr;
   uint8_t *frame = (uint8_t *)malloc(frameBytes);
   uint8_t *payload = (uint8_t *)malloc(frameBytes + 128);
-  bool ok = scripts && frame && payload && (noteCount == 0 || notes);
+  // Changed-byte bitmaps for the current frame and up to two prior displayed
+  // frames; bytes marked here get their old-data RAM inverted so the weak
+  // waveform re-drives them (ghost-trail scrubbing).
+  uint8_t *chgMap = (uint8_t *)calloc(1, mapBytes);
+  uint8_t *r1Map = redrive >= 1 ? (uint8_t *)calloc(1, mapBytes) : nullptr;
+  uint8_t *r2Map = redrive >= 2 ? (uint8_t *)calloc(1, mapBytes) : nullptr;
+  bool ok = scripts && frame && payload && chgMap &&
+            (redrive < 1 || r1Map) && (redrive < 2 || r2Map) &&
+            (noteCount == 0 || notes);
   if (ok) ok = readExact(stream, scripts, scriptBytes, stalls);
   if (ok && noteCount) {
     for (uint16_t i = 0; i < noteCount && ok; ++i) {
@@ -1145,11 +1163,14 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     }
   }
   if (!ok) {
-    detail = scripts && frame && payload ? "short stream" : "no memory";
+    detail = scripts && frame && payload && chgMap ? "short stream" : "no memory";
     free(scripts);
     free(notes);
     free(frame);
     free(payload);
+    free(chgMap);
+    free(r1Map);
+    free(r2Map);
     http.end();
     return false;
   }
@@ -1182,6 +1203,8 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   // Union of undisplayed changes: skipped frames accumulate here so the next
   // displayed frame's window covers everything the panel has not seen yet.
   size_t dirtyLo = SIZE_MAX, dirtyHi = 0;
+  // Extents of the re-drive maps (changed bytes of prior displayed frames).
+  size_t r1Lo = SIZE_MAX, r1Hi = 0, r2Lo = SIZE_MAX, r2Hi = 0;
   const size_t rowBytes = width / 8;
   for (uint16_t i = 0; i < frameCount; ++i) {
     uint8_t rawHeader[4];
@@ -1194,7 +1217,8 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     const bool cleanup = (lenAndFlags >> 24) & 0x01;
     if (payloadLen > frameBytes + 128) break;
     if (!readExact(stream, payload, payloadLen, stalls)) break;
-    if (!decodeDelta(payload, payloadLen, frame, frameBytes, dirtyLo, dirtyHi))
+    if (!decodeDelta(payload, payloadLen, frame, frameBytes, dirtyLo, dirtyHi,
+                     chgMap))
       break;
 
     if (i == 0) {
@@ -1203,6 +1227,7 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
       display.epd2.runScript(videoScript, videoLen);
       dirtyLo = SIZE_MAX;
       dirtyHi = 0;
+      memset(chgMap, 0, mapBytes);
       t0 = millis();
       if (noteCount) {
         g_buzzer.notes = notes;
@@ -1242,17 +1267,62 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
       display.epd2.runScript(cleanupScript, cleanupLen);
       display.epd2.refreshVideo(2500);
       display.epd2.runScript(videoScript, videoLen);
-      ++shown;
-    } else if (dirtyLo <= dirtyHi) {
-      const uint16_t yStart = uint16_t(dirtyLo / rowBytes);
-      const uint16_t rows = uint16_t(dirtyHi / rowBytes) - yStart + 1;
-      display.epd2.writeVideoRows(frame, yStart, rows);
-      refreshMsSum += display.epd2.refreshRows(yStart, rows, busyTimeoutMs);
-      ++refreshes;
-      rowsSum += rows;
+      // The strong cleanup drive saturated everything; all debts are paid.
+      memset(chgMap, 0, mapBytes);
+      if (r1Map) memset(r1Map, 0, mapBytes);
+      if (r2Map) memset(r2Map, 0, mapBytes);
+      r1Lo = r2Lo = SIZE_MAX;
+      r1Hi = r2Hi = 0;
       ++shown;
     } else {
-      ++shown;  // nothing changed on the panel this frame
+      // Window over this frame's changes plus the re-drive backlog.
+      size_t winLo = dirtyLo, winHi = dirtyHi;
+      if (r1Lo <= r1Hi) {
+        winLo = min(winLo, r1Lo);
+        winHi = max(winHi, r1Hi);
+      }
+      if (r2Lo <= r2Hi) {
+        winLo = min(winLo, r2Lo);
+        winHi = max(winHi, r2Hi);
+      }
+      if (winLo <= winHi) {
+        const uint16_t yStart = uint16_t(winLo / rowBytes);
+        const uint16_t rows = uint16_t(winHi / rowBytes) - yStart + 1;
+        display.epd2.writeVideoWindow(0x13, frame + size_t(yStart) * rowBytes,
+                                      yStart, rows);
+        if (redrive) {
+          // Spoof the old plane: bytes changed in this or the last N shown
+          // frames get inverted old data, forcing the weak waveform to
+          // drive all their pixels toward the current image again.
+          const size_t base = size_t(yStart) * rowBytes;
+          const size_t count = size_t(rows) * rowBytes;
+          for (size_t b = 0; b < count; ++b) {
+            const size_t idx = base + b;
+            uint8_t marked = chgMap[idx >> 3];
+            if (r1Map) marked |= r1Map[idx >> 3];
+            if (r2Map) marked |= r2Map[idx >> 3];
+            payload[b] = (marked >> (idx & 7)) & 1 ? uint8_t(~frame[idx])
+                                                   : frame[idx];
+          }
+          display.epd2.writeVideoWindow(0x10, payload, yStart, rows);
+        }
+        refreshMsSum += display.epd2.refreshRows(yStart, rows, busyTimeoutMs);
+        ++refreshes;
+        rowsSum += rows;
+      }
+      // Rotate the re-drive backlog (only when a frame was displayed).
+      if (r2Map) {
+        memcpy(r2Map, r1Map, mapBytes);
+        r2Lo = r1Lo;
+        r2Hi = r1Hi;
+      }
+      if (r1Map) {
+        memcpy(r1Map, chgMap, mapBytes);
+        r1Lo = dirtyLo;
+        r1Hi = dirtyHi;
+      }
+      memset(chgMap, 0, mapBytes);
+      ++shown;
     }
     dirtyLo = SIZE_MAX;
     dirtyHi = 0;
@@ -1273,6 +1343,9 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   free(notes);
   free(frame);
   free(payload);
+  free(chgMap);
+  free(r1Map);
+  free(r2Map);
 
   // Back to normal panel operation: stock SPI clock, fresh init, and a full
   // stock refresh via the photo restore (or a clear) to flush ghosting.
@@ -1286,7 +1359,7 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   detail = "shown=" + String(shown) + " skipped=" + String(skipped) +
            " stalls=" + String(stalls) + " avg_refresh_ms=" +
            String(avgRefresh) + " avg_rows=" + String(avgRows) +
-           (aborted ? " aborted=1" : "");
+           " redrive=" + String(redrive) + (aborted ? " aborted=1" : "");
   Serial.print("Video done: ");
   Serial.println(detail);
   return shown > 1;
