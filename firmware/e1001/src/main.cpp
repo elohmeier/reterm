@@ -1339,6 +1339,23 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     digitalWrite(kBuzzerPin, LOW);
   }
   http.end();
+
+  // Back to normal panel operation: stock SPI clock and a fresh init. A
+  // completed (or aborted) playback keeps its final frame on the panel,
+  // redrawn with a stock full refresh that also flushes the video-mode
+  // ghosting; the saved photo only returns via the menu or a new upload.
+  // Early failures fall back to the photo (or a clear) instead of leaving
+  // a half-written panel behind.
+  display.epd2.selectSPI(epaperSpi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  display.init(115200);
+  display.setRotation(0);
+  if (shown > 1) {
+    display.epd2.writeNative(frame, nullptr, 0, 0, 800, 480, false, false,
+                             false);
+    display.epd2.refresh(false);
+  } else if (!restoreSavedPhoto()) {
+    display.clearScreen();
+  }
   free(scripts);
   free(notes);
   free(frame);
@@ -1346,13 +1363,6 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   free(chgMap);
   free(r1Map);
   free(r2Map);
-
-  // Back to normal panel operation: stock SPI clock, fresh init, and a full
-  // stock refresh via the photo restore (or a clear) to flush ghosting.
-  display.epd2.selectSPI(epaperSpi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
-  display.init(115200);
-  display.setRotation(0);
-  if (!restoreSavedPhoto()) display.clearScreen();
 
   const uint32_t avgRefresh = refreshes ? refreshMsSum / refreshes : 0;
   const uint32_t avgRows = refreshes ? rowsSum / refreshes : 0;
