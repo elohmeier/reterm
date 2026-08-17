@@ -157,6 +157,34 @@ def delta_encode(prev: bytes | None, cur: bytes) -> bytes:
     return bytes(out)
 
 
+def pcm_track(path: Path, rate: int, start_s: float, duration_s: float,
+              volume: float) -> np.ndarray:
+    """Decode any ffmpeg-readable audio to 8-bit unsigned mono PCM tuned for
+    a piezo: resampled, high-passed (the disc has nothing below ~200 Hz
+    anyway and DC offsets waste drive), peak-normalized to `volume`."""
+    import av
+
+    container = av.open(str(path))
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=rate)
+    chunks = []
+    for frame in container.decode(audio=0):
+        for resampled in resampler.resample(frame):
+            chunks.append(resampled.to_ndarray().reshape(-1))
+    audio = np.concatenate(chunks).astype(np.float32) / 32768.0
+    lo = int(start_s * rate)
+    hi = lo + int(duration_s * rate)
+    audio = audio[lo:hi]
+    if len(audio) < hi - lo:
+        audio = np.pad(audio, (0, hi - lo - len(audio)))
+    # FFT high-pass at 120 Hz.
+    spectrum = np.fft.rfft(audio)
+    cutoff = int(120 * len(audio) / rate)
+    spectrum[:cutoff] = 0
+    audio = np.fft.irfft(spectrum, n=len(audio))
+    peak = np.max(np.abs(audio)) or 1.0
+    return np.clip(audio / peak * volume * 127.0 + 128.0, 0, 255).astype(np.uint8)
+
+
 def melody_from_midi(path: Path, track_index: int, limit_s: float) -> list[tuple[int, int, int]]:
     import mido
 
@@ -230,6 +258,14 @@ def main() -> int:
                         help="force a cleanup refresh at least every N seconds")
     parser.add_argument("--midi", type=Path)
     parser.add_argument("--midi-track", type=int, default=3)
+    parser.add_argument("--audio", type=Path,
+                        help="audio file for sigma-delta PCM playback through "
+                             "the piezo (any ffmpeg-readable format); "
+                             "interleaved with the frames")
+    parser.add_argument("--audio-rate", type=int, default=16000,
+                        help="PCM sample rate; 16 MHz timer base must divide "
+                             "it evenly (default: %(default)s)")
+    parser.add_argument("--volume", type=float, default=0.8)
     args = parser.parse_args()
 
     if args.waveform in WAVEFORMS:
@@ -290,26 +326,41 @@ def main() -> int:
     notes = []
     if args.midi:
         notes = melody_from_midi(args.midi, args.midi_track, duration_s)
+    audio = None
+    audio_rate = 0
+    if args.audio:
+        audio_rate = args.audio_rate
+        audio = pcm_track(args.audio, audio_rate, args.start, duration_s,
+                          args.volume)
 
     with open(args.output, "wb") as f:
         f.write(b"RTV1")
-        f.write(struct.pack("<HHHHHBBB", WIDTH, HEIGHT, interval_ms,
+        f.write(struct.pack("<HHHHHBBBH", WIDTH, HEIGHT, interval_ms,
                             len(frames), len(notes), args.spi_mhz,
                             min(255, args.busy_timeout_ms // 100),
-                            args.redrive))
+                            args.redrive, audio_rate))
         f.write(struct.pack("<HHH", len(init_script), len(video_script),
                             len(cleanup_script)))
         f.write(init_script + video_script + cleanup_script)
         for t_ms, freq, dur in notes:
             f.write(struct.pack("<IHH", t_ms, freq, dur))
-        for cleanup, payload in frames:
+        for index, (cleanup, payload) in enumerate(frames):
             f.write(struct.pack("<I", len(payload) | (0x01000000 if cleanup else 0)))
             f.write(payload)
+            if audio is not None:
+                # Interleave this frame's slice of the PCM track so audio
+                # streams alongside the frames it accompanies.
+                lo = index * audio_rate * interval_ms // 1000
+                hi = (index + 1) * audio_rate * interval_ms // 1000
+                chunk = audio[lo:hi].tobytes()
+                f.write(struct.pack("<H", len(chunk)))
+                f.write(chunk)
 
     total = args.output.stat().st_size
     cleanups = sum(1 for c, _ in frames if c)
     print(f"{len(frames)} frames @ {interval_ms} ms ({duration_s:.1f} s), "
           f"{cleanups} cleanup refreshes, {len(notes)} notes, "
+          f"audio {audio_rate} Hz, "
           f"{total / 1e6:.2f} MB ({raw_total // max(1, len(frames))} B/frame avg), "
           f"waveform {phases}, spi {args.spi_mhz} MHz")
     return 0

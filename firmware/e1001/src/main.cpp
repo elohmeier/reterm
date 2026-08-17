@@ -15,6 +15,8 @@
 #include <esp_sleep.h>
 #include <qrcode.h>
 #include <reterm.h>
+#include <soc/gpio_sd_reg.h>
+#include <soc/soc.h>
 
 namespace {
 constexpr int kSck = 7;
@@ -1001,6 +1003,50 @@ struct BuzzerTrack {
 
 BuzzerTrack g_buzzer = {nullptr, 0, 0, false, true};
 
+// Sampled audio through the piezo: the S3's sigma-delta modulator turns an
+// 8-bit duty into a high-frequency 1-bit density stream; updating the duty
+// at the PCM sample rate from a hardware-timer ISR plays real audio. The
+// ISR is a single MMIO write (no function calls), so it stays safe even
+// while flash cache is briefly disabled.
+constexpr size_t kAudioRingSize = 32768;  // power of two, ~2 s at 16 kHz
+
+struct AudioState {
+  uint8_t *ring;
+  volatile uint32_t head;
+  volatile uint32_t tail;
+  volatile uint32_t underruns;
+  uint32_t regBase;  // sigma-delta register with the duty bits cleared
+};
+
+AudioState g_pcm = {nullptr, 0, 0, 0, 0};
+hw_timer_t *g_pcmTimer = nullptr;
+
+void IRAM_ATTR audioIsr() {
+  if (g_pcm.tail != g_pcm.head) {
+    const uint8_t sample = g_pcm.ring[g_pcm.tail];
+    g_pcm.tail = (g_pcm.tail + 1) & (kAudioRingSize - 1);
+    // The hardware wants a signed density; sample^0x80 is (sample-128) in
+    // two's complement.
+    REG_WRITE(GPIO_SIGMADELTA0_REG, g_pcm.regBase | (sample ^ 0x80));
+  } else {
+    ++g_pcm.underruns;
+    REG_WRITE(GPIO_SIGMADELTA0_REG, g_pcm.regBase);  // midpoint = silence
+  }
+}
+
+size_t audioRingFree() {
+  return kAudioRingSize - 1 - ((g_pcm.head - g_pcm.tail) & (kAudioRingSize - 1));
+}
+
+void audioRingPush(const uint8_t *data, size_t length) {
+  for (size_t i = 0; i < length; ++i) {
+    const uint32_t next = (g_pcm.head + 1) & (kAudioRingSize - 1);
+    if (next == g_pcm.tail) return;  // full: drop the tail of the chunk
+    g_pcm.ring[g_pcm.head] = data[i];
+    g_pcm.head = next;
+  }
+}
+
 void buzzerTask(void *) {
   for (uint16_t i = 0; i < g_buzzer.count && !g_buzzer.stop; ++i) {
     const VideoNote &note = g_buzzer.notes[i];
@@ -1109,7 +1155,7 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   stream.setTimeout(1000);
   uint32_t stalls = 0;
 
-  uint8_t header[23];
+  uint8_t header[25];
   if (!readExact(stream, header, sizeof(header), stalls) ||
       memcmp(header, "RTV1", 4) != 0) {
     detail = "bad header";
@@ -1124,9 +1170,10 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   const uint8_t spiMhz = header[14];
   const uint16_t busyTimeoutMs = uint16_t(header[15]) * 100;
   const uint8_t redrive = header[16] > 2 ? 2 : header[16];
-  const uint16_t initLen = header[17] | (header[18] << 8);
-  const uint16_t videoLen = header[19] | (header[20] << 8);
-  const uint16_t cleanupLen = header[21] | (header[22] << 8);
+  const uint16_t audioRate = header[17] | (header[18] << 8);
+  const uint16_t initLen = header[19] | (header[20] << 8);
+  const uint16_t videoLen = header[21] | (header[22] << 8);
+  const uint16_t cleanupLen = header[23] | (header[24] << 8);
   const size_t frameBytes = size_t(width / 8) * height;
   if (width != 800 || height != 480 || frameCount == 0 || intervalMs == 0 ||
       initLen > 2048 || videoLen > 2048 || cleanupLen > 2048) {
@@ -1148,9 +1195,13 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   uint8_t *chgMap = (uint8_t *)calloc(1, mapBytes);
   uint8_t *r1Map = redrive >= 1 ? (uint8_t *)calloc(1, mapBytes) : nullptr;
   uint8_t *r2Map = redrive >= 2 ? (uint8_t *)calloc(1, mapBytes) : nullptr;
+  g_pcm.ring = audioRate ? (uint8_t *)malloc(kAudioRingSize) : nullptr;
+  uint8_t *audioChunk = audioRate ? (uint8_t *)malloc(65536) : nullptr;
   bool ok = scripts && frame && payload && chgMap &&
             (redrive < 1 || r1Map) && (redrive < 2 || r2Map) &&
-            (noteCount == 0 || notes);
+            (noteCount == 0 || notes) &&
+            (audioRate == 0 || (g_pcm.ring && audioChunk &&
+                                16000000u % audioRate == 0));
   if (ok) ok = readExact(stream, scripts, scriptBytes, stalls);
   if (ok && noteCount) {
     for (uint16_t i = 0; i < noteCount && ok; ++i) {
@@ -1171,6 +1222,9 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     free(chgMap);
     free(r1Map);
     free(r2Map);
+    free(g_pcm.ring);
+    g_pcm.ring = nullptr;
+    free(audioChunk);
     http.end();
     return false;
   }
@@ -1217,6 +1271,13 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     const bool cleanup = (lenAndFlags >> 24) & 0x01;
     if (payloadLen > frameBytes + 128) break;
     if (!readExact(stream, payload, payloadLen, stalls)) break;
+    if (audioRate) {
+      uint8_t audioHeader[2];
+      if (!readExact(stream, audioHeader, sizeof(audioHeader), stalls)) break;
+      const uint16_t audioLen = audioHeader[0] | (audioHeader[1] << 8);
+      if (audioLen && !readExact(stream, audioChunk, audioLen, stalls)) break;
+      audioRingPush(audioChunk, audioLen);
+    }
     if (!decodeDelta(payload, payloadLen, frame, frameBytes, dirtyLo, dirtyHi,
                      chgMap))
       break;
@@ -1239,6 +1300,18 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
         ledcAttachPin(kBuzzerPin, 0);
         xTaskCreatePinnedToCore(buzzerTask, "buzzer", 2048, nullptr, 1,
                                 nullptr, 0);
+      }
+      if (audioRate) {
+        // Frame 0's chunk is already in the ring; start the sample clock in
+        // step with the visible start of playback.
+        sigmaDeltaSetup(kBuzzerPin, 0, 312500);
+        g_pcm.tail = 0;
+        g_pcm.underruns = 0;
+        g_pcm.regBase = REG_READ(GPIO_SIGMADELTA0_REG) & ~0xFFu;
+        g_pcmTimer = timerBegin(1, 5, true);  // 16 MHz base
+        timerAttachInterrupt(g_pcmTimer, &audioIsr, true);
+        timerAlarmWrite(g_pcmTimer, 16000000u / audioRate, true);
+        timerAlarmEnable(g_pcmTimer);
       }
       shown = 1;
       continue;
@@ -1338,6 +1411,16 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     pinMode(kBuzzerPin, OUTPUT);
     digitalWrite(kBuzzerPin, LOW);
   }
+  if (g_pcmTimer) {
+    timerAlarmDisable(g_pcmTimer);
+    timerEnd(g_pcmTimer);
+    g_pcmTimer = nullptr;
+  }
+  if (audioRate) {
+    sigmaDeltaDetachPin(kBuzzerPin);
+    pinMode(kBuzzerPin, OUTPUT);
+    digitalWrite(kBuzzerPin, LOW);
+  }
   http.end();
 
   // Back to normal panel operation: stock SPI clock and a fresh init. A
@@ -1363,6 +1446,9 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   free(chgMap);
   free(r1Map);
   free(r2Map);
+  free(g_pcm.ring);
+  g_pcm.ring = nullptr;
+  free(audioChunk);
 
   const uint32_t avgRefresh = refreshes ? refreshMsSum / refreshes : 0;
   const uint32_t avgRows = refreshes ? rowsSum / refreshes : 0;
@@ -1370,6 +1456,10 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
            " stalls=" + String(stalls) + " avg_refresh_ms=" +
            String(avgRefresh) + " avg_rows=" + String(avgRows) +
            " redrive=" + String(redrive) + (aborted ? " aborted=1" : "");
+  if (audioRate) {
+    detail += " audio_gap_ms=" +
+              String(uint32_t(uint64_t(g_pcm.underruns) * 1000 / audioRate));
+  }
   Serial.print("Video done: ");
   Serial.println(detail);
   return shown > 1;
