@@ -2,9 +2,11 @@
 // the front buttons. The upload session, UART protocol, provisioning, and
 // persistence all live in the shared reterm lib; images travel as 1bpp packed
 // rows (bit set = white, MSB is the leftmost pixel), 48,000 bytes per screen.
+#include <Adafruit_GFX.h>
 #include <Arduino.h>
 #include <SPI.h>
 #include <ArduinoJson.h>
+#include <initializer_list>
 #include <GxEPD2_BW.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -26,9 +28,11 @@ constexpr int kDc = 11;
 constexpr int kReset = 12;
 constexpr int kBusy = 13;
 // Three active-low top buttons with board pullups, left to right: white
-// (GPIO5), green (GPIO3), white (GPIO4). The green button stays the EXT0
-// photo-session wake like the stock firmware; the two white buttons are an
-// EXT1 wake into the rock-paper-scissors game.
+// (GPIO5), white (GPIO4), green (GPIO3). The cluster sits right of center
+// above the panel (user-measured cap centers over the 16 cm drawable width:
+// 8.8 / 9.7 / 10.3 cm, i.e. screen columns 440 / 485 / 515). The green
+// button stays the EXT0 photo-session wake like the stock firmware; the two
+// white buttons are an EXT1 wake into the arcade.
 constexpr gpio_num_t kGreenButton = GPIO_NUM_3;
 constexpr int kLeftButton = 5;
 constexpr int kRightButton = 4;
@@ -118,19 +122,30 @@ class VideoPanel final : public GxEPD2_750_GDEY075T7 {
 
 GxEPD2_BW<VideoPanel, 160> display(VideoPanel(kCs, kDc, kReset, kBusy));
 
-// Center text drawn with the default 6x8 GFX font at the given size.
-void centeredText(const char *text, int16_t y, uint8_t size) {
-  display.setTextSize(size);
+// Center text drawn with the default 6x8 GFX font at the given size. The
+// Adafruit_GFX target lets the same helpers draw to the panel or to an
+// off-screen GFXcanvas1 (whose 1bpp buffer is the panel wire format).
+void centeredText(Adafruit_GFX &g, const char *text, int16_t y, uint8_t size) {
+  g.setTextSize(size);
   const int16_t width = int16_t(strlen(text)) * 6 * size;
-  display.setCursor((800 - width) / 2, y);
-  display.print(text);
+  g.setCursor((800 - width) / 2, y);
+  g.print(text);
+}
+
+void centeredText(const char *text, int16_t y, uint8_t size) {
+  centeredText(display, text, y, size);
 }
 
 // Same, but centered on an arbitrary x instead of the panel midline.
+void cellText(Adafruit_GFX &g, const char *text, int16_t cx, int16_t y,
+              uint8_t size) {
+  g.setTextSize(size);
+  g.setCursor(cx - int16_t(strlen(text)) * 3 * size, y);
+  g.print(text);
+}
+
 void cellText(const char *text, int16_t cx, int16_t y, uint8_t size) {
-  display.setTextSize(size);
-  display.setCursor(cx - int16_t(strlen(text)) * 3 * size, y);
-  display.print(text);
+  cellText(display, text, cx, y, size);
 }
 
 void drawMessageScreen(const char *line1, const char *line2) {
@@ -205,20 +220,199 @@ void drawUploadQr(const String &url) {
   } while (display.nextPage());
 }
 
+// --- Piezo audio -----------------------------------------------------------
+// Sampled audio through the piezo: the S3's sigma-delta modulator turns an
+// 8-bit duty into a high-frequency 1-bit density stream; updating the duty
+// at the PCM sample rate from a hardware-timer ISR plays real audio. The
+// ISR is a single MMIO write (no function calls), so it stays safe even
+// while flash cache is briefly disabled. Shared by the video player's
+// interleaved PCM track and the arcade's synthesized sound effects.
+
+constexpr int kBuzzerPin = 45;
+constexpr size_t kAudioRingSize = 32768;  // power of two, ~2 s at 16 kHz
+
+struct AudioState {
+  uint8_t *ring;
+  volatile uint32_t head;
+  volatile uint32_t tail;
+  volatile uint32_t underruns;
+  uint32_t regBase;  // sigma-delta register with the duty bits cleared
+};
+
+AudioState g_pcm = {nullptr, 0, 0, 0, 0};
+hw_timer_t *g_pcmTimer = nullptr;
+
+void IRAM_ATTR audioIsr() {
+  if (g_pcm.tail != g_pcm.head) {
+    const uint8_t sample = g_pcm.ring[g_pcm.tail];
+    g_pcm.tail = (g_pcm.tail + 1) & (kAudioRingSize - 1);
+    // The hardware wants a signed density; sample^0x80 is (sample-128) in
+    // two's complement.
+    REG_WRITE(GPIO_SIGMADELTA0_REG, g_pcm.regBase | (sample ^ 0x80));
+  } else {
+    ++g_pcm.underruns;
+    REG_WRITE(GPIO_SIGMADELTA0_REG, g_pcm.regBase);  // midpoint = silence
+  }
+}
+
+size_t audioRingFree() {
+  return kAudioRingSize - 1 - ((g_pcm.head - g_pcm.tail) & (kAudioRingSize - 1));
+}
+
+void audioRingPush(const uint8_t *data, size_t length) {
+  for (size_t i = 0; i < length; ++i) {
+    const uint32_t next = (g_pcm.head + 1) & (kAudioRingSize - 1);
+    if (next == g_pcm.tail) return;  // full: drop the tail of the chunk
+    g_pcm.ring[g_pcm.head] = data[i];
+    g_pcm.head = next;
+  }
+}
+
+// Starts the sample clock; whatever the ring already holds plays first. The
+// caller owns g_pcm.ring and the head/tail indices.
+bool audioStart(uint32_t sampleRate) {
+  if (!g_pcm.ring || sampleRate == 0 || 16000000u % sampleRate != 0)
+    return false;
+  g_pcm.underruns = 0;
+  sigmaDeltaSetup(kBuzzerPin, 0, 312500);
+  g_pcm.regBase = REG_READ(GPIO_SIGMADELTA0_REG) & ~0xFFu;
+  g_pcmTimer = timerBegin(1, 5, true);  // 16 MHz base
+  timerAttachInterrupt(g_pcmTimer, &audioIsr, true);
+  timerAlarmWrite(g_pcmTimer, 16000000u / sampleRate, true);
+  timerAlarmEnable(g_pcmTimer);
+  return true;
+}
+
+void audioStop() {
+  if (g_pcmTimer) {
+    timerAlarmDisable(g_pcmTimer);
+    timerEnd(g_pcmTimer);
+    g_pcmTimer = nullptr;
+  }
+  sigmaDeltaDetachPin(kBuzzerPin);
+  pinMode(kBuzzerPin, OUTPUT);
+  digitalWrite(kBuzzerPin, LOW);
+}
+
+// --- Arcade sound effects --------------------------------------------------
+// Chiptune blips synthesized straight into the audio ring; the ISR plays
+// them while the code draws and the panel refreshes, so jingles overlap the
+// slow e-paper updates for free. Square waves for the bright UI ticks,
+// triangles for the softer sad notes; every tone decays linearly so nothing
+// clicks or drones on the piezo.
+
+constexpr uint32_t kSfxRate = 16000;
+
+bool sfxBegin() {
+  if (g_pcm.ring) return true;
+  g_pcm.ring = (uint8_t *)malloc(kAudioRingSize);
+  if (!g_pcm.ring) return false;
+  g_pcm.head = g_pcm.tail = 0;
+  if (!audioStart(kSfxRate)) {
+    free(g_pcm.ring);
+    g_pcm.ring = nullptr;
+    return false;
+  }
+  return true;
+}
+
+void sfxEnd() {
+  if (!g_pcm.ring) return;
+  const uint32_t start = millis();  // let the last stinger ring out
+  while (g_pcm.tail != g_pcm.head && millis() - start < 800) delay(10);
+  audioStop();
+  free(g_pcm.ring);
+  g_pcm.ring = nullptr;
+}
+
+void sfxTone(uint16_t freqHz, uint16_t ms, uint8_t peak, bool mellow) {
+  if (!g_pcm.ring) return;
+  const uint32_t total = kSfxRate * uint32_t(ms) / 1000;
+  const uint32_t period = kSfxRate / freqHz;
+  uint8_t chunk[128];
+  size_t fill = 0;
+  for (uint32_t i = 0; i < total; ++i) {
+    const int32_t amp = int32_t(peak) * int32_t(total - i) / int32_t(total);
+    const uint32_t pos = i % period;
+    int32_t v;
+    if (mellow) {
+      const int32_t x = int32_t(pos * 4 * uint32_t(amp) / period);
+      v = x < 2 * amp ? x - amp : 3 * amp - x;
+    } else {
+      v = pos < period / 2 ? amp : -amp;
+    }
+    chunk[fill++] = uint8_t(128 + v);
+    if (fill == sizeof(chunk)) {
+      audioRingPush(chunk, fill);
+      fill = 0;
+    }
+  }
+  if (fill) audioRingPush(chunk, fill);
+}
+
+void sfxRest(uint16_t ms) {
+  if (!g_pcm.ring) return;
+  uint8_t chunk[64];
+  memset(chunk, 0x80, sizeof(chunk));
+  for (uint32_t left = kSfxRate * uint32_t(ms) / 1000; left;) {
+    const size_t n = left < sizeof(chunk) ? left : sizeof(chunk);
+    audioRingPush(chunk, n);
+    left -= n;
+  }
+}
+
+void sfxPress() { sfxTone(1319, 35, 70, false); }
+
+void sfxTick(int beat) {
+  static const uint16_t kTickHz[] = {659, 784, 988};  // rising chant
+  sfxTone(kTickHz[beat], 50, 70, false);
+}
+
+void sfxShoot() {
+  sfxTone(1047, 45, 80, false);
+  sfxTone(1568, 110, 80, false);
+}
+
+void sfxWin() {
+  sfxTone(523, 80, 85, false);
+  sfxTone(659, 80, 85, false);
+  sfxTone(784, 80, 85, false);
+  sfxTone(1047, 220, 90, false);
+}
+
+void sfxLose() {
+  sfxTone(392, 130, 85, true);
+  sfxTone(330, 130, 85, true);
+  sfxTone(262, 260, 85, true);
+}
+
+void sfxDraw() {
+  sfxTone(880, 70, 70, false);
+  sfxRest(50);
+  sfxTone(880, 70, 70, false);
+}
+
 // --- Rock, paper, scissors -------------------------------------------------
-// A white-button wake plays against the hardware RNG. While a screen is up,
-// every top button picks a move in physical order: left white = rock, green =
-// paper, right white = scissors. The lifetime score persists in its own NVS
-// namespace; the panel keeps whatever screen was up last, and the next photo
-// session or MQTT image replaces it as usual.
+// Played against the hardware RNG, with an animated chant on the panel's
+// fast register-LUT waveform and chiptune blips through the piezo. The
+// three top buttons sit in a tight cluster right of center (see the pin
+// comment up top), so the play screen anchors a legend under the real caps
+// and the moves follow the physical order: left white = rock, right white =
+// paper, green = scissors. The lifetime score persists in its own NVS
+// namespace; the panel keeps whatever screen was up last, and the next
+// photo session or MQTT image replaces it as usual.
 
 constexpr uint32_t kGameIdleMs = 60 * 1000;
 constexpr const char *kMoveNames[] = {"ROCK", "PAPER", "SCISSORS"};
-constexpr const char *kMoveButtons[] = {"LEFT BUTTON", "GREEN BUTTON",
-                                        "RIGHT BUTTON"};
 constexpr const char *kWinReasons[] = {"Rock blunts scissors",
                                        "Paper wraps rock",
                                        "Scissors cut paper"};
+
+// Screen columns under the measured button cap centers, and the wider fan
+// the legend icons spread to so they stay readable (the caps sit only 45
+// and 30 px apart).
+constexpr int16_t kBtnCols[] = {440, 485, 515};
+constexpr int16_t kLegendCols[] = {400, 485, 570};
 
 struct RpsScore {
   uint32_t wins = 0;
@@ -250,8 +444,8 @@ void saveRpsScore(const RpsScore &score) {
 // The icons draw with GFX primitives on a +/-50 unit grid scaled to a size s
 // box centered on (cx, cy), so all three read at any size without bitmaps.
 
-void thickLine(float x0, float y0, float x1, float y1, float thickness,
-               uint16_t color) {
+void thickLine(Adafruit_GFX &g, float x0, float y0, float x1, float y1,
+               float thickness, uint16_t color) {
   const float dx = x1 - x0, dy = y1 - y0;
   const float len = sqrtf(dx * dx + dy * dy);
   if (len < 1) return;
@@ -261,13 +455,13 @@ void thickLine(float x0, float y0, float x1, float y1, float thickness,
   const int16_t bx = lroundf(x0 - ox), by = lroundf(y0 - oy);
   const int16_t cx = lroundf(x1 + ox), cy = lroundf(y1 + oy);
   const int16_t ex = lroundf(x1 - ox), ey = lroundf(y1 - oy);
-  display.fillTriangle(ax, ay, bx, by, cx, cy, color);
-  display.fillTriangle(bx, by, ex, ey, cx, cy, color);
+  g.fillTriangle(ax, ay, bx, by, cx, cy, color);
+  g.fillTriangle(bx, by, ex, ey, cx, cy, color);
 }
 
 // A faceted boulder: a filled polygon fan with white crack lines meeting the
 // silhouette at its corners so they read as facet edges.
-void drawRockIcon(int16_t cx, int16_t cy, int16_t s) {
+void drawRockIcon(Adafruit_GFX &g, int16_t cx, int16_t cy, int16_t s) {
   const auto px = [&](float u) { return int16_t(lroundf(cx + u * s / 100)); };
   const auto py = [&](float v) { return int16_t(lroundf(cy + v * s / 100)); };
   static constexpr int8_t outline[][2] = {{-44, 34}, {-50, 4},  {-34, -24},
@@ -275,15 +469,15 @@ void drawRockIcon(int16_t cx, int16_t cy, int16_t s) {
                                           {48, 16},  {32, 40}};
   constexpr size_t n = sizeof(outline) / sizeof(outline[0]);
   for (size_t i = 1; i + 1 < n; ++i) {
-    display.fillTriangle(px(outline[0][0]), py(outline[0][1]),
-                         px(outline[i][0]), py(outline[i][1]),
-                         px(outline[i + 1][0]), py(outline[i + 1][1]),
-                         GxEPD_BLACK);
+    g.fillTriangle(px(outline[0][0]), py(outline[0][1]),
+                   px(outline[i][0]), py(outline[i][1]),
+                   px(outline[i + 1][0]), py(outline[i + 1][1]),
+                   GxEPD_BLACK);
   }
   const auto crack = [&](float x0, float y0, float x1, float y1) {
-    display.drawLine(px(x0), py(y0), px(x1), py(y1), GxEPD_WHITE);
-    display.drawLine(px(x0) + 1, py(y0), px(x1) + 1, py(y1), GxEPD_WHITE);
-    display.drawLine(px(x0), py(y0) + 1, px(x1), py(y1) + 1, GxEPD_WHITE);
+    g.drawLine(px(x0), py(y0), px(x1), py(y1), GxEPD_WHITE);
+    g.drawLine(px(x0) + 1, py(y0), px(x1) + 1, py(y1), GxEPD_WHITE);
+    g.drawLine(px(x0), py(y0) + 1, px(x1), py(y1) + 1, GxEPD_WHITE);
   };
   crack(-10, -42, -4, -2);
   crack(-4, -2, -44, 34);
@@ -291,7 +485,7 @@ void drawRockIcon(int16_t cx, int16_t cy, int16_t s) {
 }
 
 // A ruled sheet with a dog-eared top-right corner.
-void drawPaperIcon(int16_t cx, int16_t cy, int16_t s) {
+void drawPaperIcon(Adafruit_GFX &g, int16_t cx, int16_t cy, int16_t s) {
   const int16_t w = s * 68 / 100;
   const int16_t h = s * 88 / 100;
   const int16_t x0 = cx - w / 2;
@@ -299,28 +493,28 @@ void drawPaperIcon(int16_t cx, int16_t cy, int16_t s) {
   const int16_t fold = s * 26 / 100;
   int16_t border = s / 45;
   if (border < 3) border = 3;
-  display.fillRect(x0, y0, w, h, GxEPD_BLACK);
-  display.fillRect(x0 + border, y0 + border, w - 2 * border, h - 2 * border,
-                   GxEPD_WHITE);
+  g.fillRect(x0, y0, w, h, GxEPD_BLACK);
+  g.fillRect(x0 + border, y0 + border, w - 2 * border, h - 2 * border,
+             GxEPD_WHITE);
   // Cut the corner outside the fold, then draw the turned-down flap; its
   // hypotenuse doubles as the cut edge.
-  display.fillTriangle(x0 + w - fold, y0, x0 + w - 1, y0, x0 + w - 1,
-                       y0 + fold, GxEPD_WHITE);
-  display.fillTriangle(x0 + w - fold, y0, x0 + w - 1, y0 + fold, x0 + w - fold,
-                       y0 + fold, GxEPD_BLACK);
+  g.fillTriangle(x0 + w - fold, y0, x0 + w - 1, y0, x0 + w - 1,
+                 y0 + fold, GxEPD_WHITE);
+  g.fillTriangle(x0 + w - fold, y0, x0 + w - 1, y0 + fold, x0 + w - fold,
+                 y0 + fold, GxEPD_BLACK);
   int16_t rule = s / 55;
   if (rule < 2) rule = 2;
   for (int i = 0; i < 4; ++i) {
     const int16_t y = y0 + fold + s * 8 / 100 + i * (s * 12 / 100);
-    display.fillRect(x0 + s * 12 / 100, y,
-                     w - 2 * (s * 12 / 100) - (i == 3 ? w / 4 : 0), rule,
-                     GxEPD_BLACK);
+    g.fillRect(x0 + s * 12 / 100, y,
+               w - 2 * (s * 12 / 100) - (i == 3 ? w / 4 : 0), rule,
+               GxEPD_BLACK);
   }
 }
 
 // Open scissors: two blade-to-handle strips crossing at a riveted pivot,
 // pointed blades up, ringed handles down.
-void drawScissorsIcon(int16_t cx, int16_t cy, int16_t s) {
+void drawScissorsIcon(Adafruit_GFX &g, int16_t cx, int16_t cy, int16_t s) {
   const auto px = [&](float u) { return cx + u * s / 100; };
   const auto py = [&](float v) { return cy + v * s / 100; };
   const float pivotX = px(0), pivotY = py(2);
@@ -331,25 +525,26 @@ void drawScissorsIcon(int16_t cx, int16_t cy, int16_t s) {
     const float bladeLen = sqrtf(bladeDx * bladeDx + bladeDy * bladeDy);
     const float ox = -bladeDy / bladeLen * s * 0.055f;
     const float oy = bladeDx / bladeLen * s * 0.055f;
-    display.fillTriangle(lroundf(tipX), lroundf(tipY), lroundf(pivotX + ox),
-                         lroundf(pivotY + oy), lroundf(pivotX - ox),
-                         lroundf(pivotY - oy), GxEPD_BLACK);
-    thickLine(pivotX, pivotY, ringX, ringY, s * 0.07f, GxEPD_BLACK);
-    display.fillCircle(lroundf(ringX), lroundf(ringY), lroundf(s * 0.16f),
-                       GxEPD_BLACK);
-    display.fillCircle(lroundf(ringX), lroundf(ringY), lroundf(s * 0.09f),
-                       GxEPD_WHITE);
+    g.fillTriangle(lroundf(tipX), lroundf(tipY), lroundf(pivotX + ox),
+                   lroundf(pivotY + oy), lroundf(pivotX - ox),
+                   lroundf(pivotY - oy), GxEPD_BLACK);
+    thickLine(g, pivotX, pivotY, ringX, ringY, s * 0.07f, GxEPD_BLACK);
+    g.fillCircle(lroundf(ringX), lroundf(ringY), lroundf(s * 0.16f),
+                 GxEPD_BLACK);
+    g.fillCircle(lroundf(ringX), lroundf(ringY), lroundf(s * 0.09f),
+                 GxEPD_WHITE);
   }
-  display.fillCircle(lroundf(pivotX), lroundf(pivotY), lroundf(s * 0.05f),
-                     GxEPD_BLACK);
-  display.fillCircle(lroundf(pivotX), lroundf(pivotY), lroundf(s * 0.02f),
-                     GxEPD_WHITE);
+  g.fillCircle(lroundf(pivotX), lroundf(pivotY), lroundf(s * 0.05f),
+               GxEPD_BLACK);
+  g.fillCircle(lroundf(pivotX), lroundf(pivotY), lroundf(s * 0.02f),
+               GxEPD_WHITE);
 }
 
-void drawMoveIcon(int move, int16_t cx, int16_t cy, int16_t s) {
-  if (move == 0) drawRockIcon(cx, cy, s);
-  else if (move == 1) drawPaperIcon(cx, cy, s);
-  else drawScissorsIcon(cx, cy, s);
+void drawMoveIcon(Adafruit_GFX &g, int move, int16_t cx, int16_t cy,
+                  int16_t s) {
+  if (move == 0) drawRockIcon(g, cx, cy, s);
+  else if (move == 1) drawPaperIcon(g, cx, cy, s);
+  else drawScissorsIcon(g, cx, cy, s);
 }
 
 String scoreLine(const RpsScore &score) {
@@ -357,69 +552,19 @@ String scoreLine(const RpsScore &score) {
          " reTerminal   (" + String(score.draws) + " draws)";
 }
 
-void drawChoiceScreen(const RpsScore &score) {
-  static constexpr int16_t cellX[] = {150, 400, 650};
-  const String scores = scoreLine(score);
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
-    centeredText("ROCK  PAPER  SCISSORS", 16, 4);
-    centeredText("Beat the reTerminal: pick a move with a top button", 66, 2);
-    for (int move = 0; move < 3; ++move) {
-      drawMoveIcon(move, cellX[move], 205, 170);
-      cellText(kMoveNames[move], cellX[move], 308, 3);
-      cellText(kMoveButtons[move], cellX[move], 342, 2);
-    }
-    centeredText(scores.c_str(), 398, 2);
-    centeredText("Hold GREEN for the menu - a minute idle sleeps", 446, 2);
-  } while (display.nextPage());
-}
-
-// diff is (player - machine + 3) % 3: 1 = player won, 2 = machine won.
-void drawResultScreen(int player, int machine, int diff,
-                      const RpsScore &score) {
-  const char *verdict =
-      diff == 1 ? "YOU WIN!" : diff == 2 ? "RETERMINAL WINS" : "IT'S A DRAW";
-  const char *reason = diff == 0 ? "Same move - nobody scores"
-                                 : kWinReasons[diff == 1 ? player : machine];
-  const int16_t winnerX = diff == 1 ? 210 : 590;
-  const String scores = scoreLine(score);
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
-    centeredText(verdict, 18, 5);
-    centeredText(reason, 68, 2);
-    cellText("YOU", 210, 104, 3);
-    cellText("RETERMINAL", 590, 104, 3);
-    drawMoveIcon(player, 210, 240, 190);
-    drawMoveIcon(machine, 590, 240, 190);
-    cellText(kMoveNames[player], 210, 364, 2);
-    cellText(kMoveNames[machine], 590, 364, 2);
-    display.setTextSize(4);
-    display.setCursor(376, 222);
-    display.print("VS");
-    if (diff != 0) {
-      for (int16_t inset = 0; inset < 3; ++inset) {
-        display.drawRoundRect(winnerX - 122 + inset, 136 + inset,
-                              244 - 2 * inset, 216 - 2 * inset, 14,
-                              GxEPD_BLACK);
-      }
-    }
-    centeredText(scores.c_str(), 402, 2);
-    centeredText("Rematch: LEFT rock  GREEN paper  RIGHT scissors", 430, 2);
-    centeredText("Hold GREEN for the menu", 456, 2);
-  } while (display.nextPage());
-}
-
-// Button indices in physical order; the RPS move mapping (rock/paper/
-// scissors) is the same order, so games can use these values directly.
+// Button indices; kBtnLeft/kBtnRight are the adjacent white pair, green
+// sits to their right.
 constexpr int kBtnLeft = 0;
 constexpr int kBtnGreen = 1;
 constexpr int kBtnRight = 2;
+
+// Moves follow the physical cap order (left white, right white, green), so
+// the on-screen legend reads rock-paper-scissors straight across.
+int moveForButton(int button) {
+  if (button == kBtnLeft) return 0;   // rock
+  if (button == kBtnRight) return 1;  // paper
+  return 2;                           // green throws scissors
+}
 
 int readButton() {
   if (digitalRead(kLeftButton) == LOW) return kBtnLeft;
@@ -471,42 +616,6 @@ ButtonPress waitForPress(uint32_t timeoutMs) {
     return {kBtnGreen, false};
   }
   return {-1, false};
-}
-
-// Returns true when the player held green to go back to the menu; false on
-// the idle timeout, which leaves the last screen on the panel.
-bool playRockPaperScissors() {
-  Serial.println("Arcade: rock paper scissors");
-  RpsScore score = loadRpsScore();
-  waitForButtonsReleased();
-  drawChoiceScreen(score);
-  for (;;) {
-    const ButtonPress press = waitForPress(kGameIdleMs);
-    if (press.button < 0) {
-      Serial.println("Game idle; handing back to the standard flow");
-      waitForButtonsReleased();
-      return false;
-    }
-    if (press.button == kBtnGreen && press.longPress) {
-      waitForButtonsReleased();
-      return true;
-    }
-    const int player = press.button;  // button order matches the move order
-    const int machine = int(esp_random() % 3);
-    const int diff = (player - machine + 3) % 3;
-    if (diff == 1) ++score.wins;
-    else if (diff == 2) ++score.losses;
-    else ++score.draws;
-    saveRpsScore(score);
-    Serial.print("RPS round: player=");
-    Serial.print(kMoveNames[player]);
-    Serial.print(" reterminal=");
-    Serial.print(kMoveNames[machine]);
-    Serial.print(" outcome=");
-    Serial.println(diff == 1 ? "win" : diff == 2 ? "loss" : "draw");
-    drawResultScreen(player, machine, diff, score);
-    waitForButtonsReleased();
-  }
 }
 
 // --- Arcade sprites --------------------------------------------------------
@@ -646,22 +755,28 @@ constexpr const char *kSpriteEgg[] = {
     "..XXXXXXXX..",
 };
 
-void drawSpriteImpl(const char *const rows[], int count, int16_t x, int16_t y,
-                    int16_t scale) {
+void drawSpriteImpl(Adafruit_GFX &g, const char *const rows[], int count,
+                    int16_t x, int16_t y, int16_t scale) {
   for (int j = 0; j < count; ++j) {
     for (int i = 0; rows[j][i]; ++i) {
       const char cell = rows[j][i];
       if (cell == '.') continue;
-      display.fillRect(x + i * scale, y + j * scale, scale, scale,
-                       cell == 'X' ? GxEPD_BLACK : GxEPD_WHITE);
+      g.fillRect(x + i * scale, y + j * scale, scale, scale,
+                 cell == 'X' ? GxEPD_BLACK : GxEPD_WHITE);
     }
   }
 }
 
 template <size_t N>
+void drawSprite(Adafruit_GFX &g, const char *const (&rows)[N], int16_t x,
+                int16_t y, int16_t scale) {
+  drawSpriteImpl(g, rows, int(N), x, y, scale);
+}
+
+template <size_t N>
 void drawSprite(const char *const (&rows)[N], int16_t x, int16_t y,
                 int16_t scale) {
-  drawSpriteImpl(rows, int(N), x, y, scale);
+  drawSpriteImpl(display, rows, int(N), x, y, scale);
 }
 
 // Centers the sprite on cx with its feet on the ground line.
@@ -669,8 +784,271 @@ template <size_t N>
 void drawSpriteOnGround(const char *const (&rows)[N], int16_t cx,
                         int16_t ground, int16_t scale) {
   const int16_t width = int16_t(strlen(rows[0])) * scale;
-  drawSpriteImpl(rows, int(N), cx - width / 2, ground - int16_t(N) * scale,
-                 scale);
+  drawSpriteImpl(display, rows, int(N), cx - width / 2,
+                 ground - int16_t(N) * scale, scale);
+}
+
+// --- Rock, paper, scissors: screens and rounds -----------------------------
+// The whole game renders into one full-screen GFXcanvas1 whose 1bpp buffer
+// is exactly the panel wire format (bit set = white, MSB leftmost), so a
+// frame can go out either through a stock full refresh or through the fast
+// register-LUT window path the video player uses. Static header and hints
+// live outside the arena band; every animated element stays inside it, so
+// partial refreshes never leave stale chrome behind.
+
+constexpr int16_t kArenaY = 104;   // the animated band: rows 104..423
+constexpr int16_t kArenaH = 320;
+constexpr int16_t kPlayerX = 210;
+constexpr int16_t kMachineX = 590;
+
+// Small icons at the physical button positions: a tab silhouette per real
+// cap (whites hollow, the green cap solid and slimmer, like the hardware),
+// a stem fanning out to an icon box, and the move icon with its name.
+void drawButtonLegend(Adafruit_GFX &g) {
+  for (int move = 0; move < 3; ++move) {
+    const int16_t bx = kBtnCols[move];
+    const int16_t cx = kLegendCols[move];
+    if (move == 2) {
+      g.fillRoundRect(bx - 12, 0, 24, 11, 4, GxEPD_BLACK);
+    } else {
+      g.drawRoundRect(bx - 15, 0, 30, 11, 4, GxEPD_BLACK);
+      g.drawRoundRect(bx - 14, 1, 28, 9, 3, GxEPD_BLACK);
+    }
+    thickLine(g, bx, 12, cx, 26, 3, GxEPD_BLACK);
+    g.drawRoundRect(cx - 24, 26, 48, 48, 8, GxEPD_BLACK);
+    drawMoveIcon(g, move, cx, 50, 40);
+    cellText(g, kMoveNames[move], cx, 78, 1);
+  }
+}
+
+void clearArena(Adafruit_GFX &g) {
+  g.fillRect(0, kArenaY, 800, kArenaH, GxEPD_WHITE);
+  g.setTextColor(GxEPD_BLACK);
+}
+
+// Idle arena: two closed fists (the rock silhouette) facing off.
+void drawArenaIdle(Adafruit_GFX &g, const RpsScore &score) {
+  clearArena(g);
+  cellText(g, "YOU", kPlayerX, 128, 2);
+  cellText(g, "RETERMINAL", kMachineX, 128, 2);
+  drawRockIcon(g, kPlayerX, 250, 150);
+  drawRockIcon(g, kMachineX, 250, 150);
+  cellText(g, "VS", 400, 234, 4);
+  centeredText(g, "PRESS A BUTTON TO THROW", 356, 3);
+  centeredText(g, scoreLine(score).c_str(), 398, 2);
+}
+
+// One chant frame: both fists pump down on each spoken word.
+void drawArenaCountdown(Adafruit_GFX &g, const RpsScore &score, int beat,
+                        bool down) {
+  clearArena(g);
+  cellText(g, "YOU", kPlayerX, 128, 2);
+  cellText(g, "RETERMINAL", kMachineX, 128, 2);
+  const int16_t cy = down ? 268 : 240;
+  drawRockIcon(g, kPlayerX, cy, 150);
+  drawRockIcon(g, kMachineX, cy, 150);
+  cellText(g, kMoveNames[beat], 400, 150, 4);
+  centeredText(g, scoreLine(score).c_str(), 398, 2);
+}
+
+// The reveal: both icons pop in small, then full size with the verdict.
+// diff is (player - machine + 3) % 3: 1 = player won, 2 = machine won.
+void drawArenaReveal(Adafruit_GFX &g, const RpsScore &score, int player,
+                     int machine, int diff, bool full) {
+  clearArena(g);
+  drawMoveIcon(g, player, kPlayerX, 265, full ? 180 : 120);
+  drawMoveIcon(g, machine, kMachineX, 265, full ? 180 : 120);
+  cellText(g, "VS", 400, 250, 4);
+  if (!full) return;
+  const char *verdict = diff == 1   ? "YOU WIN!"
+                        : diff == 2 ? "RETERMINAL WINS"
+                                    : "IT'S A DRAW";
+  centeredText(g, verdict, 118, 4);
+  if (diff != 0) {
+    const int16_t winnerX = diff == 1 ? kPlayerX : kMachineX;
+    for (int16_t inset = 0; inset < 3; ++inset) {
+      g.drawRoundRect(winnerX - 118 + inset, 168 + inset, 236 - 2 * inset,
+                      194 - 2 * inset, 14, GxEPD_BLACK);
+    }
+    if (diff == 1) {
+      drawSprite(g, kSpriteSparkle, kPlayerX - 172, 180, 3);
+      drawSprite(g, kSpriteSparkle, kPlayerX + 130, 300, 3);
+    }
+  }
+  const char *reason = diff == 0 ? "Same move - nobody scores"
+                                 : kWinReasons[diff == 1 ? player : machine];
+  centeredText(g, reason, 372, 2);
+  centeredText(g, scoreLine(score).c_str(), 398, 2);
+}
+
+void drawPlayScreen(Adafruit_GFX &g, const RpsScore &score) {
+  g.fillScreen(GxEPD_WHITE);
+  g.setTextColor(GxEPD_BLACK);
+  g.setTextSize(3);
+  g.setCursor(20, 16);
+  g.print("ROCK PAPER SCISSORS");
+  g.setTextSize(2);
+  g.setCursor(20, 56);
+  g.print("Beat the hardware dice");
+  drawButtonLegend(g);
+  drawArenaIdle(g, score);
+  centeredText(g, "Each top button throws the move shown beneath it", 430, 2);
+  centeredText(g, "Hold GREEN for the menu - a minute idle sleeps", 452, 2);
+}
+
+// Fast partial refreshes for the chant: the same UC8179 register-LUT trick
+// the video player uses, with the proven stream settings baked in (five
+// phases of one 28 ms frame, direct drive, ~175 ms per refresh); see
+// tools/encode-video.py build_scripts for the register map. Ghosting from
+// the weak waveform is flushed by the stock full refresh that closes every
+// round.
+
+uint8_t g_gameInit[48];
+uint8_t g_gameLut[280];
+size_t g_gameInitLen = 0, g_gameLutLen = 0;
+
+void putScript(uint8_t *buf, size_t &at, uint8_t cmd,
+               std::initializer_list<uint8_t> data) {
+  buf[at++] = cmd;
+  buf[at++] = uint8_t(data.size());
+  for (uint8_t b : data) buf[at++] = b;
+}
+
+void putLut(uint8_t *buf, size_t &at, uint8_t reg, uint8_t level) {
+  buf[at++] = reg;
+  buf[at++] = 42;
+  uint8_t lut[42] = {level, 1, 1, 1, 1, 1};
+  memcpy(buf + at, lut, sizeof(lut));
+  at += sizeof(lut);
+}
+
+void buildGameScripts() {
+  if (g_gameInitLen) return;
+  size_t at = 0;
+  putScript(g_gameInit, at, 0x00, {0x1f});  // panel setting, OTP full LUT
+  putScript(g_gameInit, at, 0x01, {0x07, 0x07, 0x3f, 0x3f, 0x09});  // power
+  putScript(g_gameInit, at, 0x06, {0x17, 0x17, 0x28, 0x17});  // booster
+  putScript(g_gameInit, at, 0x61, {0x03, 0x20, 0x01, 0xe0});  // 800x480
+  putScript(g_gameInit, at, 0x15, {0x00});        // DUSPI off
+  putScript(g_gameInit, at, 0x50, {0x29, 0x07});  // VCOM/CDI, N2OCP
+  putScript(g_gameInit, at, 0x60, {0x22});        // TCON
+  putScript(g_gameInit, at, 0xE3, {0x22});        // PWS
+  putScript(g_gameInit, at, 0x04, {});            // power on (busy-waits)
+  g_gameInitLen = at;
+  at = 0;
+  putScript(g_gameLut, at, 0x00, {0x3f});         // LUTs from registers
+  putScript(g_gameLut, at, 0x82, {0x30});         // VCOM DC -2.5 V
+  putScript(g_gameLut, at, 0x50, {0x39, 0x07});   // LUTBD, N2OCP
+  putLut(g_gameLut, at, 0x20, 0x00);
+  putLut(g_gameLut, at, 0x21, 0x00);
+  putLut(g_gameLut, at, 0x22, 0xAA);  // black -> white, direct drive
+  putLut(g_gameLut, at, 0x23, 0x55);  // white -> black, direct drive
+  putLut(g_gameLut, at, 0x24, 0x00);
+  putLut(g_gameLut, at, 0x25, 0x00);
+  g_gameLutLen = at;
+}
+
+// Stock full refresh of a canvas frame; also flushes fast-mode ghosting.
+void showCanvas(const uint8_t *screen) {
+  display.epd2.selectSPI(epaperSpi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  display.init(115200);
+  display.setRotation(0);
+  display.epd2.writeNative(screen, nullptr, 0, 0, 800, 480, false, false,
+                           false);
+  display.epd2.refresh(false);
+}
+
+// Swaps the panel into register-LUT fast mode with both RAM planes seeded
+// from the currently displayed screen, so the first partial refresh
+// transitions from the true panel state.
+void enterGameFast(const uint8_t *screen) {
+  buildGameScripts();
+  display.epd2.selectSPI(epaperSpi,
+                         SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  display.init(115200);
+  display.setRotation(0);
+  display.epd2.runScript(g_gameInit, g_gameInitLen);
+  display.epd2.runScript(g_gameLut, g_gameLutLen);
+  display.epd2.writeVideoWindow(0x10, screen, 0, 480);
+  display.epd2.writeVideoWindow(0x13, screen, 0, 480);
+}
+
+void pushArena(const uint8_t *screen) {
+  display.epd2.writeVideoWindow(0x13, screen + size_t(kArenaY) * 100, kArenaY,
+                                kArenaH);
+  display.epd2.refreshRows(kArenaY, kArenaH, 1200);
+}
+
+// One full round: the ro-sham-bo chant on the fast waveform, the reveal,
+// then a crisp stock refresh of the verdict while the stinger plays.
+void playRpsRound(GFXcanvas1 &canvas, const RpsScore &score, int player,
+                  int machine, int diff) {
+  enterGameFast(canvas.getBuffer());
+  for (int beat = 0; beat < 3; ++beat) {
+    for (int up = 0; up < 2; ++up) {
+      if (!up) sfxTick(beat);
+      drawArenaCountdown(canvas, score, beat, up == 0);
+      pushArena(canvas.getBuffer());
+    }
+  }
+  sfxShoot();
+  drawArenaReveal(canvas, score, player, machine, diff, false);
+  pushArena(canvas.getBuffer());
+  drawArenaReveal(canvas, score, player, machine, diff, true);
+  pushArena(canvas.getBuffer());
+  if (diff == 1) sfxWin();
+  else if (diff == 2) sfxLose();
+  else sfxDraw();
+  showCanvas(canvas.getBuffer());
+}
+
+// Returns true when the player held green to go back to the menu; false on
+// the idle timeout, which leaves the last screen on the panel.
+bool playRockPaperScissors() {
+  Serial.println("Arcade: rock paper scissors");
+  RpsScore score = loadRpsScore();
+  GFXcanvas1 *canvas = new GFXcanvas1(800, 480);
+  if (!canvas || !canvas->getBuffer()) {
+    delete canvas;
+    Serial.println("RPS: no memory for the frame canvas");
+    return false;
+  }
+  sfxBegin();
+  waitForButtonsReleased();
+  drawPlayScreen(*canvas, score);
+  showCanvas(canvas->getBuffer());
+  bool toMenu = false;
+  for (;;) {
+    const ButtonPress press = waitForPress(kGameIdleMs);
+    if (press.button < 0) {
+      Serial.println("Game idle; handing back to the standard flow");
+      break;
+    }
+    if (press.button == kBtnGreen && press.longPress) {
+      toMenu = true;
+      break;
+    }
+    sfxPress();
+    const int player = moveForButton(press.button);
+    const int machine = int(esp_random() % 3);
+    const int diff = (player - machine + 3) % 3;
+    if (diff == 1) ++score.wins;
+    else if (diff == 2) ++score.losses;
+    else ++score.draws;
+    saveRpsScore(score);
+    Serial.print("RPS round: player=");
+    Serial.print(kMoveNames[player]);
+    Serial.print(" reterminal=");
+    Serial.print(kMoveNames[machine]);
+    Serial.print(" outcome=");
+    Serial.println(diff == 1 ? "win" : diff == 2 ? "loss" : "draw");
+    playRpsRound(*canvas, score, player, machine, diff);
+    waitForButtonsReleased();
+  }
+  sfxEnd();
+  delete canvas;
+  waitForButtonsReleased();
+  return toMenu;
 }
 
 // --- Luna the unicorn ------------------------------------------------------
@@ -985,8 +1363,6 @@ void petTimerTick() {
 // MQTT command event. The melody runs on its own task on the other core so
 // note timing survives the long SPI writes and busy waits.
 
-constexpr int kBuzzerPin = 45;
-
 struct VideoNote {
   uint32_t tMs;
   uint16_t freqHz;
@@ -1002,50 +1378,6 @@ struct BuzzerTrack {
 };
 
 BuzzerTrack g_buzzer = {nullptr, 0, 0, false, true};
-
-// Sampled audio through the piezo: the S3's sigma-delta modulator turns an
-// 8-bit duty into a high-frequency 1-bit density stream; updating the duty
-// at the PCM sample rate from a hardware-timer ISR plays real audio. The
-// ISR is a single MMIO write (no function calls), so it stays safe even
-// while flash cache is briefly disabled.
-constexpr size_t kAudioRingSize = 32768;  // power of two, ~2 s at 16 kHz
-
-struct AudioState {
-  uint8_t *ring;
-  volatile uint32_t head;
-  volatile uint32_t tail;
-  volatile uint32_t underruns;
-  uint32_t regBase;  // sigma-delta register with the duty bits cleared
-};
-
-AudioState g_pcm = {nullptr, 0, 0, 0, 0};
-hw_timer_t *g_pcmTimer = nullptr;
-
-void IRAM_ATTR audioIsr() {
-  if (g_pcm.tail != g_pcm.head) {
-    const uint8_t sample = g_pcm.ring[g_pcm.tail];
-    g_pcm.tail = (g_pcm.tail + 1) & (kAudioRingSize - 1);
-    // The hardware wants a signed density; sample^0x80 is (sample-128) in
-    // two's complement.
-    REG_WRITE(GPIO_SIGMADELTA0_REG, g_pcm.regBase | (sample ^ 0x80));
-  } else {
-    ++g_pcm.underruns;
-    REG_WRITE(GPIO_SIGMADELTA0_REG, g_pcm.regBase);  // midpoint = silence
-  }
-}
-
-size_t audioRingFree() {
-  return kAudioRingSize - 1 - ((g_pcm.head - g_pcm.tail) & (kAudioRingSize - 1));
-}
-
-void audioRingPush(const uint8_t *data, size_t length) {
-  for (size_t i = 0; i < length; ++i) {
-    const uint32_t next = (g_pcm.head + 1) & (kAudioRingSize - 1);
-    if (next == g_pcm.tail) return;  // full: drop the tail of the chunk
-    g_pcm.ring[g_pcm.head] = data[i];
-    g_pcm.head = next;
-  }
-}
 
 void buzzerTask(void *) {
   for (uint16_t i = 0; i < g_buzzer.count && !g_buzzer.stop; ++i) {
@@ -1196,6 +1528,8 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   uint8_t *r1Map = redrive >= 1 ? (uint8_t *)calloc(1, mapBytes) : nullptr;
   uint8_t *r2Map = redrive >= 2 ? (uint8_t *)calloc(1, mapBytes) : nullptr;
   g_pcm.ring = audioRate ? (uint8_t *)malloc(kAudioRingSize) : nullptr;
+  // The arcade shares the ring globals; start from a clean queue.
+  g_pcm.head = g_pcm.tail = 0;
   uint8_t *audioChunk = audioRate ? (uint8_t *)malloc(65536) : nullptr;
   bool ok = scripts && frame && payload && chgMap &&
             (redrive < 1 || r1Map) && (redrive < 2 || r2Map) &&
@@ -1302,16 +1636,9 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
                                 nullptr, 0);
       }
       if (audioRate) {
-        // Frame 0's chunk is already in the ring; start the sample clock in
-        // step with the visible start of playback.
-        sigmaDeltaSetup(kBuzzerPin, 0, 312500);
-        g_pcm.tail = 0;
-        g_pcm.underruns = 0;
-        g_pcm.regBase = REG_READ(GPIO_SIGMADELTA0_REG) & ~0xFFu;
-        g_pcmTimer = timerBegin(1, 5, true);  // 16 MHz base
-        timerAttachInterrupt(g_pcmTimer, &audioIsr, true);
-        timerAlarmWrite(g_pcmTimer, 16000000u / audioRate, true);
-        timerAlarmEnable(g_pcmTimer);
+        // Frame 0's chunk is already in the ring; the sample clock starts
+        // in step with the visible start of playback.
+        audioStart(audioRate);
       }
       shown = 1;
       continue;
@@ -1411,16 +1738,7 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
     pinMode(kBuzzerPin, OUTPUT);
     digitalWrite(kBuzzerPin, LOW);
   }
-  if (g_pcmTimer) {
-    timerAlarmDisable(g_pcmTimer);
-    timerEnd(g_pcmTimer);
-    g_pcmTimer = nullptr;
-  }
-  if (audioRate) {
-    sigmaDeltaDetachPin(kBuzzerPin);
-    pinMode(kBuzzerPin, OUTPUT);
-    digitalWrite(kBuzzerPin, LOW);
-  }
+  if (audioRate) audioStop();
   http.end();
 
   // Back to normal panel operation: stock SPI clock and a fresh init. A
@@ -1504,7 +1822,7 @@ void drawMenuScreen(int selected) {
       cellText(entries[entry], 405, y + 17, 3);
       display.setTextColor(GxEPD_BLACK);
       if (entry == 0) {
-        drawScissorsIcon(110, y + 29, 48);
+        drawScissorsIcon(display, 110, y + 29, 48);
       } else if (entry == 1) {
         drawSprite(kSpriteUnicorn, 88, y + 5, 3);
       } else if (entry == 2) {
@@ -1518,7 +1836,7 @@ void drawMenuScreen(int selected) {
         drawSprite(kSpriteApple, 90, y + 5, 4);
       }
     }
-    centeredText("LEFT down    GREEN choose    RIGHT up", 436, 2);
+    centeredText("WHITE buttons scroll    GREEN chooses", 436, 2);
   } while (display.nextPage());
 }
 

@@ -91,10 +91,21 @@ top button, or hold the green button for about a second — from sleep, from a
 game, or while a QR upload session or the provisioning portal is on screen
 (the session closes cleanly and the menu opens instead). A green tap still
 starts the photo session directly, and holding green for five seconds
-through a wake still forgets the saved Wi-Fi. The menu (left/right moves the
-selection, green chooses) offers rock paper scissors against the hardware
-RNG, Luna — a slow unicorn tamagotchi — a "send a photo" entry that starts
-an upload session, and a shortcut back to the last photo. Luna ages with the Home Assistant timer wakes (one interval
+through a wake still forgets the saved Wi-Fi. The menu (white buttons scroll,
+green chooses) offers rock paper scissors against the hardware RNG, Luna —
+a slow unicorn tamagotchi — a "send a photo" entry that starts an upload
+session, and a shortcut back to the last photo.
+
+Rock paper scissors knows where the buttons are: the three caps cluster
+right of center above the panel (measured cap centers 8.8 / 9.7 / 10.3 cm
+across the 16 cm drawable width), so the play screen draws a tab for each
+physical cap with its move icon fanned out beneath it, and the moves follow
+the physical order — left white throws rock, right white paper, green
+scissors. Each round runs an animated ro-sham-bo chant on the video
+player's fast register-LUT waveform (~175 ms partial refreshes, ghosting
+flushed by the crisp full refresh that reveals the verdict) with chiptune
+blips and win/lose stingers synthesized through the piezo's sigma-delta
+path. Luna ages with the Home Assistant timer wakes (one interval
 per check-in), hatches after eight hours, and grows through foal, unicorn,
 and celestial stages; the white buttons feed her and play with her, and two
 days of starvation send her off in a whirlwind until a new egg is adopted.
