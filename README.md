@@ -104,13 +104,23 @@ back. Game scores and pet state persist in NVS across firmware updates.
 
 The menu's BAD APPLE entry replays the last video delivered over MQTT. The
 E1001 plays RTV1 streams produced by `tools/encode-video.py`: 1bpp
-delta-encoded frames driven with encoder-supplied UC8179 waveform scripts
-(so refresh speed, ghost-cleanup policy, and SPI clock are tuned by
-re-encoding, not reflashing), plus a monophonic buzzer note track extracted
-from a MIDI file. Publish `{"action":"video","url":"http://..."}` on the
-frame's command topic; playback stats come back on the event topic, and
-holding green aborts playback. Video and MIDI sources stay out of this
-repository.
+delta-encoded frames driven with encoder-supplied UC8179 waveform scripts,
+so refresh speed (`--waveform`, `--drive direct` for double push per
+refresh), ghost handling (`--redrive` re-drives recent transitions via the
+controller's old-data RAM; scene-cut cleanups use a strong register
+waveform), and SPI clock are all tuned by re-encoding, never reflashing.
+About 5 fps sustained on the 800x480 panel; a completed playback keeps its
+final frame. Audio plays through the piezo via the ESP32-S3 sigma-delta
+modulator: `--audio song.m4a` interleaves a 16 kHz 8-bit PCM track
+(band-limited to the piezo's 200 Hz-5 kHz, soft-compressed, dithered), or
+`--chiptune --midi song.mid` synthesizes a square/triangle/drums render
+that suits the disc far better than a full mix. Publish
+`{"action":"video","url":"http://..."}` on the frame's command topic;
+playback stats (shown/skipped, refresh times, audio underruns) come back
+on the event topic, and holding green aborts. Video, audio, and MIDI
+sources stay out of this repository. Note the waveforms run the panel well
+outside its datasheet duty cycle — an occasional screening is fine,
+continuous looping would age it.
 
 Pixel art: the unicorn, horse, and tornado come from Clint Bellanger's
 [Tiny Creatures](https://opengameart.org/content/tiny-creatures) (CC0); the
