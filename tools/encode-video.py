@@ -176,13 +176,58 @@ def pcm_track(path: Path, rate: int, start_s: float, duration_s: float,
     audio = audio[lo:hi]
     if len(audio) < hi - lo:
         audio = np.pad(audio, (0, hi - lo - len(audio)))
-    # FFT high-pass at 120 Hz.
+    return finish_pcm(audio, rate, volume)
+
+
+def finish_pcm(audio: np.ndarray, rate: int, volume: float) -> np.ndarray:
+    """Shared mastering for the piezo: band-limit into the disc's usable
+    range (its resonance sits near 4 kHz; content outside 200 Hz - 5 kHz
+    only comes back as hash), soft-compress so a dense mix survives 8 bits,
+    and TPDF-dither so quantization error becomes hiss instead of crackle."""
     spectrum = np.fft.rfft(audio)
-    cutoff = int(120 * len(audio) / rate)
-    spectrum[:cutoff] = 0
+    freqs = np.fft.rfftfreq(len(audio), 1.0 / rate)
+    spectrum[freqs < 200] = 0
+    spectrum[freqs > 5000] = 0
     audio = np.fft.irfft(spectrum, n=len(audio))
-    peak = np.max(np.abs(audio)) or 1.0
-    return np.clip(audio / peak * volume * 127.0 + 128.0, 0, 255).astype(np.uint8)
+    peak = float(np.max(np.abs(audio))) or 1.0
+    audio = np.tanh(2.2 * audio / peak) / np.tanh(2.2)
+    rng = np.random.default_rng(1)
+    dither = (rng.random(len(audio)) + rng.random(len(audio)) - 1.0) / 127.0
+    return np.clip((audio + dither) * volume * 127.0 + 128.0,
+                   0, 255).astype(np.uint8)
+
+
+def synth_chiptune(midi_path: Path, rate: int, duration_s: float,
+                   volume: float) -> np.ndarray:
+    """Render the MIDI as a chiptune (square lead, triangle bass, kick and
+    hats) — limited voices and no broadband mix content, which is exactly
+    what a resonant piezo disc reproduces cleanly."""
+    n = int(duration_s * rate)
+    mix = np.zeros(n, np.float32)
+
+    def add_notes(track: int, render, level: float) -> None:
+        for t_ms, freq, dur_ms in melody_from_midi(midi_path, track,
+                                                   duration_s):
+            start = t_ms * rate // 1000
+            count = min(n - start, max(1, dur_ms * rate // 1000))
+            if count <= 0:
+                continue
+            t = np.arange(count, dtype=np.float32) / rate
+            mix[start:start + count] += level * render(t, freq)
+
+    add_notes(3, lambda t, f:  # square lead, plucky decay
+              np.sign(np.sin(2 * np.pi * f * t)) * np.exp(-t / 0.22), 0.42)
+    add_notes(4, lambda t, f:  # triangle bass, rounder
+              (2 / np.pi) * np.arcsin(np.sin(2 * np.pi * f * t)) *
+              np.exp(-t / 0.30), 0.30)
+    add_notes(5, lambda t, f:  # kick: pitch-swept thump
+              np.sin(2 * np.pi * (140 - 90 * np.minimum(t / 0.12, 1)) * t) *
+              np.exp(-t / 0.09), 0.60)
+    rng = np.random.default_rng(2)
+    add_notes(6, lambda t, f:  # hat: short quiet noise tick
+              rng.standard_normal(len(t)).astype(np.float32) *
+              np.exp(-t / 0.025), 0.10)
+    return finish_pcm(mix, rate, volume)
 
 
 def melody_from_midi(path: Path, track_index: int, limit_s: float) -> list[tuple[int, int, int]]:
@@ -262,6 +307,10 @@ def main() -> int:
                         help="audio file for sigma-delta PCM playback through "
                              "the piezo (any ffmpeg-readable format); "
                              "interleaved with the frames")
+    parser.add_argument("--chiptune", action="store_true",
+                        help="synthesize the PCM track from --midi instead of "
+                             "--audio: square lead, triangle bass, drums — "
+                             "much cleaner on a piezo than a full mix")
     parser.add_argument("--audio-rate", type=int, default=16000,
                         help="PCM sample rate; 16 MHz timer base must divide "
                              "it evenly (default: %(default)s)")
@@ -324,14 +373,19 @@ def main() -> int:
 
     duration_s = len(frames) * interval_ms / 1000.0
     notes = []
-    if args.midi:
-        notes = melody_from_midi(args.midi, args.midi_track, duration_s)
     audio = None
     audio_rate = 0
-    if args.audio:
+    if args.chiptune:
+        if not args.midi:
+            parser.error("--chiptune needs --midi")
+        audio_rate = args.audio_rate
+        audio = synth_chiptune(args.midi, audio_rate, duration_s, args.volume)
+    elif args.audio:
         audio_rate = args.audio_rate
         audio = pcm_track(args.audio, audio_rate, args.start, duration_s,
                           args.volume)
+    elif args.midi:
+        notes = melody_from_midi(args.midi, args.midi_track, duration_s)
 
     with open(args.output, "wb") as f:
         f.write(b"RTV1")
