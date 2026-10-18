@@ -70,7 +70,8 @@ measurements and input-space dithering colors.
 ## Wireless photo upload
 
 Press a button on the sleeping frame (the touch controls on the E1004, the
-green button on the E1001) to open a five-minute wireless upload session. On
+green button held for about a second on the E1001, or SEND A PHOTO in its
+menu) to open a five-minute wireless upload session. On
 first use, scan the displayed Wi-Fi QR and use the captive portal to save a
 home network. The device then displays a one-time QR whose link carries the
 session token and device model; the editor dithers for that panel and streams
@@ -84,21 +85,45 @@ To change networks later, hold the E1001's green button for five seconds
 through a wake, or call the authenticated `POST /api/wifi/forget` endpoint
 during an open session; the next wake shows the captive portal again.
 
-## E1001 arcade
+## E1001 views and menu
 
-The arcade menu is always one gesture away: wake the E1001 with either white
-top button, or hold the green button for about a second — from sleep, from a
-game, or while a QR upload session or the provisioning portal is on screen
-(the session closes cleanly and the menu opens instead). A green tap still
-starts the photo session directly, and holding green for five seconds
-through a wake still forgets the saved Wi-Fi. The menu (white buttons scroll,
-green chooses) offers rock paper scissors against the hardware RNG, Luna —
-a slow unicorn tamagotchi — a "send a photo" entry that starts an upload
-session, and a shortcut back to the last photo.
+The E1001 is content first. With views delivered by a `pages` command (see
+[docs/home-assistant.md](docs/home-assistant.md)), the white buttons flip
+between them — left back, right forward, from sleep or while awake, without
+any network — and the last uploaded photo is one more view. The frame stays
+awake 20 seconds for further flips; a timer wake brings the home view back
+after 15 minutes.
+
+A green tap opens the menu (left white up, right white down, green opens,
+green held goes back): **Jetzt aktualisieren** checks in right away and
+shows a new image if there is one; **Ansicht** picks a view; **Foto
+senden** starts the upload session; **Status** shows battery, Wi-Fi, the
+last check-in, image freshness, the next wake, and firmware; **Einstellungen**
+switches sound and the status LED, refreshes the panel fully, restarts, or
+— green held three more seconds — forgets the Wi-Fi; **Spiele** holds rock
+paper scissors, Luna the unicorn tamagotchi, and the Bad Apple player.
+Holding green for about a second through a wake goes straight to the
+upload session, five seconds forgets the saved Wi-Fi, and holding green in
+an upload session or the provisioning portal opens the menu.
+
+The menu uses DejaVu Sans Condensed (13 and 18 px) and Fraunces (33 px) as
+Adafruit GFX fonts. `tools/make-gfx-fonts.py` renders them into
+`firmware/e1001/src/fonts/` (Latin-1) with FreeType's hinted monochrome
+rasterizer and its exact integer metrics, so every glyph sits on the
+baseline; HarfBuzz picks Fraunces's glyphs under its variation settings and
+measures kerning pairs, which the UI's `text()` applies (GFX fonts carry
+none). Sizes are those where hinting keeps the x-height uniform — the
+generator refuses others. `tools/preview-gfx-fonts.py out.png` draws sample
+strings straight from the generated headers, as the panel will, and checks
+their baselines. A button wake lights
+the LED and clicks at once; screen changes are calm partial refreshes, row
+steps the games' fast waveform on just the affected rows (about 0.2 s), and
+presses are counted by edge interrupts so quick taps never get lost. Button
+hints hang from the top edge under the physical caps.
 
 Rock paper scissors knows where the buttons are: the three caps cluster
-right of center above the panel (measured cap centers 8.8 / 9.7 / 10.3 cm
-across the 16 cm drawable width), so the play screen draws a tab for each
+right of center above the panel (cap centers measured on screen with a
+ruler view at x = 450 / 493 / 545 px), so the play screen draws a tab for each
 physical cap with its move icon fanned out beneath it, and the moves follow
 the physical order — left white throws rock, right white paper, green
 scissors. Each round runs an animated ro-sham-bo chant on the video

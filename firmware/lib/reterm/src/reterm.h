@@ -70,6 +70,17 @@ class Board {
   // from that session again any number of times.
   virtual MenuAction onMenu() { return MenuAction::Sleep; }
 
+  // Draws (show=true) or removes (show=false) the staleness badge: `text` in
+  // a box at x/y/w/h over the saved image, as a windowed partial refresh, and
+  // leaves the panel hibernated. Removing needs the same text and box so the
+  // controller's old-data plane matches what the panel shows. Return false
+  // when unsupported; the runtime then never claims a badge is up.
+  virtual bool drawBadge(int16_t x, int16_t y, int16_t w, int16_t h,
+                         const char *text, bool show) {
+    (void)x; (void)y; (void)w; (void)h; (void)text; (void)show;
+    return false;
+  }
+
   // True when this boot was caused by the board's wake control.
   virtual bool wokeByButton() const = 0;
   // Called once right after a button wake. Return true when the user keeps
@@ -80,10 +91,65 @@ class Board {
   virtual void prepareSleep() = 0;
 };
 
+// Initializes the runtime (geometry, buffers, battery reading, settings,
+// storage, panel and page state) so a board can use the API below before
+// run(), e.g. from its wake-time menu. Idempotent; run() calls it too.
+void begin(Board &board);
+
 // Runs the full boot flow: UART command window, upload session on button
 // wake, and deep sleep. Serial and the panel must already be initialized.
 // Never returns.
 void run(Board &board);
+
+// --- Pages (views) ---------------------------------------------------------
+// A server can deliver several named full-screen images with one `pages`
+// MQTT command; the first is the home view the panel returns to. The last
+// manually uploaded photo is appended as a local "Foto" page. Boards flip
+// between them without any network.
+size_t pageCount();
+String pageTitle(size_t index);
+// Reads page `index` (geometry().imageBytes() bytes) into `buffer`.
+bool readPage(size_t index, uint8_t *buffer);
+// The page the panel shows, or -1 when it shows something else (a manual
+// upload outside the page set, a QR screen, a game).
+int shownPage();
+// Boards call this after they put page `index` on the panel.
+void notePageShown(size_t index);
+
+// --- Status and actions ----------------------------------------------------
+struct Status {
+  int batteryMv;
+  int batteryPct;
+  int rssi;             // at the last successful check-in
+  String ssid;
+  String ip;
+  uint32_t lastCheckin;  // epoch of the last successful check-in, 0 = never
+  uint32_t nextWake;     // planned epoch, 0 = unknown
+  uint32_t issued;       // content time of the server image on the panel
+  bool clock;            // wall clock known
+  bool stale;            // the server image on the panel is out of date
+  bool serverImage;      // the panel shows a server-delivered image
+  uint32_t wakeMinutes;  // fallback wake interval
+  bool brokerConfigured;
+  const char *firmware;
+};
+Status status();
+
+// Checks in right now (Wi-Fi, MQTT state, retained commands, images, pages).
+// `changed` reports whether the panel image was replaced on the way.
+bool checkInNow(bool &changed);
+
+// Boards call this when they draw their own screens over the saved image
+// (menus, games, wall modes: shows=false) and when they repaint the saved
+// image in full (shows=true, which also clears any badge). The staleness
+// badge is only ever patched onto the clean saved image. Safe to call before
+// run().
+void notePanelShowsSavedImage(bool shows);
+
+// Latency instrumentation: records `name` (a string literal) with the time
+// since boot. The next MQTT check-in of this boot publishes the marks as a
+// {"event":"timing",...} event. At most 32 marks per boot.
+void mark(const char *name);
 
 // 32 hex characters from the hardware RNG.
 String makeToken();

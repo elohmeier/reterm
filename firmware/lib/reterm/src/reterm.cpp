@@ -9,9 +9,15 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <esp_ota_ops.h>
 #include <esp_random.h>
 #include <esp_sleep.h>
 #include <mbedtls/sha256.h>
+#include <time.h>
+
+#include <algorithm>
+#include <vector>
 
 namespace reterm {
 namespace {
@@ -24,6 +30,22 @@ constexpr char kAllowedOrigin[] = "https://elohmeier.github.io";
 constexpr char kSavedImagePath[] = "/current-image.bin";
 constexpr char kBackupImagePath[] = "/previous-image.bin";
 constexpr char kPendingImagePath[] = "/pending-image.bin";
+
+// Pages (see "Pages" below).
+constexpr char kPagesPrefsNamespace[] = "reterm-pages";
+constexpr char kPhotoPath[] = "/photo.bin";
+constexpr size_t kMaxPages = 8;
+constexpr uint32_t kReturnHomeSeconds = 15 * 60;  // another view stays this long
+
+struct Page {
+  String name;
+  String title;
+  String sha256;
+};
+std::vector<Page> g_pages;
+RTC_DATA_ATTR int8_t rtcShownPage = -1;      // index into the page list
+RTC_DATA_ATTR uint32_t rtcPageShownAt = 0;   // epoch of the last flip
+bool copyFile(const char *from, const char *to);
 
 // Both boards route VBAT through a 1:2 divider on GPIO1 (ADC1) gated by a
 // load switch on GPIO21, so the divider only draws current while sampling.
@@ -96,6 +118,9 @@ const char kLocalUploader[] PROGMEM = R"HTML(<!doctype html>
 <script src="https://elohmeier.github.io/reterm/device-boot.js?v=5"
 onerror="document.getElementById('app').textContent='Could not fetch the editor from the internet. Give this phone internet access, then reload.'"></script>)HTML";
 
+void notePanelImage(bool fromServer, const String &sha256, uint32_t issued);
+void notePanelRestored();
+
 void abortPendingImage() {
   if (pendingImage) pendingImage.close();
   if (imageStorageReady && SPIFFS.exists(kPendingImagePath))
@@ -126,6 +151,7 @@ bool commitPendingImage() {
     return false;
   }
   if (SPIFFS.exists(kBackupImagePath)) SPIFFS.remove(kBackupImagePath);
+  notePanelImage(false, "", 0);
   return true;
 }
 
@@ -150,6 +176,7 @@ bool restoreSavedImage() {
   saved.close();
   g_board->refresh();
   g_board->hibernate();
+  notePanelRestored();
   Serial.println("Saved image restored");
   return true;
 }
@@ -192,6 +219,7 @@ int batteryPercent(int millivolts) {
 const char *wakeReason() {
   switch (esp_sleep_get_wakeup_cause()) {
     case ESP_SLEEP_WAKEUP_EXT0:
+    case ESP_SLEEP_WAKEUP_EXT1:
       return "button";
     case ESP_SLEEP_WAKEUP_TIMER:
       return "timer";
@@ -240,6 +268,298 @@ void storeLastCommandId(const String &id) {
   preferences.end();
 }
 
+// ---------------------------------------------------------------------------
+// Clock, wake schedule, and staleness.
+//
+// The device keeps wall-clock time in the RTC across deep sleep and syncs it
+// over SNTP from the DHCP gateway on every check-in. A server publishes a
+// retained schedule on reterm/<id>/schedule, which the device reads but
+// never clears:
+//
+//   {"wake":[epoch,...], "valid_until":epoch, "sha256":"...",
+//    "badge":[x,y,w,h], "tz":"POSIX TZ"}
+//
+// The device sleeps until the first listed wake still ahead (falling back to
+// the wake interval when the list runs out or the clock is unknown), and
+// marks a server-delivered image stale once `valid_until` passed or the
+// server meant a different image (sha256) than the panel shows. A stale
+// image gets a small "STAND <day> <time>" badge, drawn by the board as a
+// partial refresh and removed again once fresh content or schedule arrives.
+
+constexpr char kSchedPrefsNamespace[] = "reterm-sched";
+constexpr char kDefaultTz[] = "CET-1CEST,M3.5.0,M10.5.0/3";  // Europe/Berlin
+constexpr time_t kClockValidAfter = 1700000000;  // earlier means never set
+constexpr size_t kMaxScheduledWakes = 96;
+constexpr uint32_t kMinSleepSeconds = 20;
+
+struct Schedule {
+  std::vector<uint32_t> wakes;  // ascending epochs
+  uint32_t validUntil = 0;
+  String sha256;
+  int16_t badge[4] = {0, 0, 0, 0};
+  bool hasBadge = false;
+  String tz;
+};
+
+// What the panel shows. Only images delivered by an MQTT image command can
+// go stale; manual uploads are never badged.
+struct PanelState {
+  bool fromServer = false;
+  String sha256;
+  uint32_t issued = 0;     // content time from the command, else display time
+  bool clean = true;       // the panel shows the saved image, nothing else
+  bool badge = false;      // a badge is drawn over it
+  String badgeText;
+  int16_t badgeBox[4] = {0, 0, 0, 0};
+};
+
+Schedule g_schedule;
+PanelState g_panel;
+
+// Latency marks live in RTC memory so wakes without a check-in (page flips,
+// menus) report at the next one. Names are copied: a pointer into flash
+// would dangle after an OTA update.
+struct Mark {
+  char name[12];
+  uint32_t ms;
+  uint16_t boot;
+};
+constexpr size_t kMaxMarks = 48;
+RTC_DATA_ATTR Mark g_marks[kMaxMarks];
+RTC_DATA_ATTR uint32_t g_markCount = 0;
+RTC_DATA_ATTR uint16_t g_bootCount = 0;
+bool g_clockSynced = false;  // SNTP completed during this boot
+bool g_badgeChecked = false;  // updateBadge() already ran this boot
+bool g_checkinOk = false;     // the last check-in reached the broker
+
+bool clockValid() { return time(nullptr) > kClockValidAfter; }
+
+uint32_t nowEpoch() { return clockValid() ? uint32_t(time(nullptr)) : 0; }
+
+void applyTimezone() {
+  setenv("TZ", g_schedule.tz.length() ? g_schedule.tz.c_str() : kDefaultTz, 1);
+  tzset();
+}
+
+bool parseSchedule(const String &json, Schedule &out) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return false;
+  Schedule parsed;
+  for (JsonVariant wake : doc["wake"].as<JsonArray>()) {
+    if (parsed.wakes.size() >= kMaxScheduledWakes) break;
+    const uint32_t at = wake | 0u;
+    if (at > kClockValidAfter) parsed.wakes.push_back(at);
+  }
+  std::sort(parsed.wakes.begin(), parsed.wakes.end());
+  parsed.validUntil = doc["valid_until"] | 0u;
+  parsed.sha256 = String(doc["sha256"] | "");
+  parsed.sha256.toLowerCase();
+  JsonArray box = doc["badge"].as<JsonArray>();
+  if (box.size() == 4) {
+    for (int i = 0; i < 4; ++i) parsed.badge[i] = box[i] | 0;
+    parsed.hasBadge = parsed.badge[2] > 0 && parsed.badge[3] > 0;
+  }
+  parsed.tz = String(doc["tz"] | "");
+  out = parsed;
+  return true;
+}
+
+void loadPanelState() {
+  Preferences preferences;
+  if (!preferences.begin(kSchedPrefsNamespace, true)) return;
+  parseSchedule(preferences.getString("sched", ""), g_schedule);
+  g_panel.fromServer = preferences.getBool("server", false);
+  g_panel.sha256 = preferences.getString("sha", "");
+  g_panel.issued = preferences.getUInt("issued", 0);
+  g_panel.clean = preferences.getBool("clean", true);
+  g_panel.badge = preferences.getBool("badge", false);
+  g_panel.badgeText = preferences.getString("btext", "");
+  preferences.getBytes("bbox", g_panel.badgeBox, sizeof(g_panel.badgeBox));
+  preferences.end();
+  applyTimezone();
+}
+
+void savePanelState() {
+  Preferences preferences;
+  if (!preferences.begin(kSchedPrefsNamespace, false)) return;
+  preferences.putBool("server", g_panel.fromServer);
+  preferences.putString("sha", g_panel.sha256);
+  preferences.putUInt("issued", g_panel.issued);
+  preferences.putBool("clean", g_panel.clean);
+  preferences.putBool("badge", g_panel.badge);
+  preferences.putString("btext", g_panel.badgeText);
+  preferences.putBytes("bbox", g_panel.badgeBox, sizeof(g_panel.badgeBox));
+  preferences.end();
+}
+
+void storeSchedule(const String &json) {
+  Schedule parsed;
+  if (!parseSchedule(json, parsed)) {
+    Serial.println("Ignoring malformed schedule");
+    return;
+  }
+  g_schedule = parsed;
+  applyTimezone();
+  Preferences preferences;
+  if (!preferences.begin(kSchedPrefsNamespace, false)) return;
+  preferences.putString("sched", json);
+  preferences.end();
+  Serial.print("Schedule stored, wakes = ");
+  Serial.println(unsigned(g_schedule.wakes.size()));
+}
+
+// Any image that reached the panel through the runtime: a server image
+// (fromServer, with its sha256 and content time) or a manual upload.
+void notePanelImage(bool fromServer, const String &sha256, uint32_t issued) {
+  g_panel.fromServer = fromServer;
+  g_panel.sha256 = sha256;
+  g_panel.sha256.toLowerCase();
+  g_panel.issued = issued ? issued : nowEpoch();
+  g_panel.clean = true;
+  g_panel.badge = false;
+  savePanelState();
+}
+
+void notePanelRestored() {
+  g_panel.clean = true;
+  g_panel.badge = false;
+  savePanelState();
+}
+
+// One NTP request to the DHCP gateway (OPNsense-style networks serve NTP
+// there and often block it elsewhere). lwIP's SNTP client delays its first
+// request by seconds, which every check-in paid for; a single UDP exchange
+// takes a few milliseconds. Best effort: the RTC carries the time across
+// sleeps, a missed sync only adds drift.
+void syncClock() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiUDP udp;
+  if (!udp.begin(0)) return;
+  uint8_t packet[48] = {0x23};  // LI 0, version 4, mode 3 (client)
+  const IPAddress gateway = WiFi.gatewayIP();
+  udp.beginPacket(gateway, 123);
+  udp.write(packet, sizeof(packet));
+  udp.endPacket();
+  const uint32_t sentAt = millis();
+  g_clockSynced = false;
+  while (millis() - sentAt < 1000) {
+    if (udp.parsePacket() >= 48 && udp.read(packet, sizeof(packet)) == 48) {
+      const uint32_t seconds = uint32_t(packet[40]) << 24 |
+                               uint32_t(packet[41]) << 16 |
+                               uint32_t(packet[42]) << 8 | packet[43];
+      const uint32_t fraction = uint32_t(packet[44]) << 24 |
+                                uint32_t(packet[45]) << 16 |
+                                uint32_t(packet[46]) << 8 | packet[47];
+      constexpr uint32_t kNtpToUnix = 2208988800UL;
+      if (seconds > kNtpToUnix + kClockValidAfter) {
+        // Half the round trip approximates the server's send delay.
+        const uint32_t halfTripUs = (millis() - sentAt) * 500;
+        timeval now;
+        now.tv_sec = time_t(seconds - kNtpToUnix);
+        now.tv_usec = suseconds_t((uint64_t(fraction) * 1000000ULL) >> 32) + halfTripUs;
+        if (now.tv_usec >= 1000000) {
+          now.tv_sec += 1;
+          now.tv_usec -= 1000000;
+        }
+        settimeofday(&now, nullptr);
+        g_clockSynced = true;
+      }
+      break;
+    }
+    delay(2);
+  }
+  udp.stop();
+  applyTimezone();
+  Serial.print(g_clockSynced ? "Clock synced from " : "Clock sync failed via ");
+  Serial.println(gateway);
+  mark(g_clockSynced ? "ntp" : "ntp-fail");
+}
+
+// Seconds to sleep and the planned wall-clock wake (0 when unknown). Zero
+// seconds means no timer wake at all (integration off or interval 0).
+uint32_t plannedSleepSeconds(uint32_t *wakeAt = nullptr) {
+  if (wakeAt) *wakeAt = 0;
+  if (!g_haConfig.enabled() || g_haConfig.wakeMinutes == 0) return 0;
+  const uint32_t fallback = g_haConfig.wakeMinutes * 60;
+  const uint32_t now = nowEpoch();
+  if (now) {
+    for (uint32_t at : g_schedule.wakes) {
+      if (at < now + kMinSleepSeconds) continue;
+      if (at - now > kMaxWakeMinutes * 60) break;
+      if (wakeAt) *wakeAt = at;
+      return at - now;
+    }
+    if (wakeAt) *wakeAt = now + fallback;
+  }
+  return fallback;
+}
+
+// The longest planned sleep ahead, so Home Assistant does not mark the
+// device unavailable across a scheduled quiet period.
+uint32_t longestPlannedGapSeconds() {
+  uint32_t longest = g_haConfig.wakeMinutes * 60;
+  uint32_t previous = nowEpoch();
+  if (!previous) return longest;
+  for (uint32_t at : g_schedule.wakes) {
+    if (at <= previous) continue;
+    if (at - previous <= kMaxWakeMinutes * 60)
+      longest = max(longest, at - previous);
+    previous = at;
+  }
+  return longest;
+}
+
+bool panelStale() {
+  if (!g_panel.fromServer || !g_schedule.validUntil) return false;
+  if (g_schedule.sha256.length() == 64 && g_schedule.sha256 != g_panel.sha256)
+    return true;
+  const uint32_t now = nowEpoch();
+  return now && now > g_schedule.validUntil;
+}
+
+String badgeText() {
+  static constexpr const char *days[] = {"SO", "MO", "DI", "MI",
+                                         "DO", "FR", "SA"};
+  if (!g_panel.issued) return "NICHT AKTUELL";
+  const time_t issued = g_panel.issued;
+  struct tm local;
+  localtime_r(&issued, &local);
+  char text[32];
+  snprintf(text, sizeof(text), "STAND %s %02d:%02d", days[local.tm_wday],
+           local.tm_hour, local.tm_min);
+  return text;
+}
+
+// Draws or removes the badge to match panelStale(). Returns true when the
+// panel was touched (and hibernated by the board).
+bool updateBadge() {
+  const bool stale = panelStale();
+  if (stale && !g_panel.badge && g_panel.clean && g_schedule.hasBadge) {
+    const String text = badgeText();
+    const int16_t *box = g_schedule.badge;
+    if (!g_board->drawBadge(box[0], box[1], box[2], box[3], text.c_str(), true))
+      return false;
+    Serial.print("Stale image badged: ");
+    Serial.println(text);
+    g_panel.badge = true;
+    g_panel.badgeText = text;
+    memcpy(g_panel.badgeBox, box, sizeof(g_panel.badgeBox));
+    savePanelState();
+    return true;
+  }
+  if (!stale && g_panel.badge && g_panel.clean) {
+    const int16_t *box = g_panel.badgeBox;
+    if (!g_board->drawBadge(box[0], box[1], box[2], box[3],
+                            g_panel.badgeText.c_str(), false))
+      return false;
+    Serial.println("Image current again; badge removed");
+    g_panel.badge = false;
+    savePanelState();
+    return true;
+  }
+  return false;
+}
+
 // The board supplies the static geometry object; reopen it and append the
 // per-boot fields so /api/status and MQTT report live device state.
 String dynamicStatusJson() {
@@ -257,6 +577,26 @@ String dynamicStatusJson() {
   json += WiFi.localIP().toString();
   json += "\",\"wake_interval_min\":";
   json += g_haConfig.wakeMinutes;
+  uint32_t wakeAt = 0;
+  plannedSleepSeconds(&wakeAt);
+  json += ",\"next_wake\":";
+  json += wakeAt;
+  if (wakeAt) {
+    const time_t at = wakeAt;
+    struct tm utc;
+    gmtime_r(&at, &utc);
+    char iso[24];
+    strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    json += ",\"next_wake_iso\":\"";
+    json += iso;
+    json += "\"";
+  }
+  json += ",\"clock\":";
+  json += clockValid() ? "true" : "false";
+  json += ",\"stale\":";
+  json += panelStale() ? "true" : "false";
+  json += ",\"badge\":";
+  json += g_panel.badge ? "true" : "false";
   json += "}";
   return json;
 }
@@ -317,6 +657,7 @@ StartupCommand receiveStartupCommand() {
     }
   }
   Serial.println("IMAGE RECEIVED");
+  notePanelImage(false, "", 0);
   g_board->refresh();
   g_board->hibernate();
   Serial.println("IMAGE DISPLAYED");
@@ -325,18 +666,20 @@ StartupCommand receiveStartupCommand() {
 
 void goToSleep() {
   Serial.println("Entering deep sleep; press the button for upload mode");
-  if (g_haConfig.enabled() && g_haConfig.wakeMinutes > 0) {
-    Serial.print("Timer wake armed for Home Assistant check-in, minutes = ");
-    Serial.println(g_haConfig.wakeMinutes);
+  uint32_t wakeAt = 0;
+  const uint32_t sleepSeconds = plannedSleepSeconds(&wakeAt);
+  if (sleepSeconds) {
+    Serial.print("Timer wake armed for Home Assistant check-in, seconds = ");
+    Serial.print(sleepSeconds);
+    Serial.print(wakeAt ? ", at epoch " : "");
+    if (wakeAt) Serial.print(wakeAt);
+    Serial.println();
   }
   Serial.flush();
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
   g_board->prepareSleep();
-  if (g_haConfig.enabled() && g_haConfig.wakeMinutes > 0) {
-    esp_sleep_enable_timer_wakeup(uint64_t(g_haConfig.wakeMinutes) * 60ULL *
-                                  1000000ULL);
-  }
+  if (sleepSeconds) esp_sleep_enable_timer_wakeup(uint64_t(sleepSeconds) * 1000000ULL);
   delay(50);
   esp_deep_sleep_start();
 }
@@ -565,6 +908,10 @@ void handleRawImage() {
     if (httpBytes == g_geometry.imageBytes() && httpY == g_geometry.height &&
         httpRowFill == 0 && commitPendingImage()) {
       imageReady = true;
+      // The last manual upload stays reachable as the "Foto" page.
+      copyFile(kSavedImagePath, kPhotoPath);
+      rtcShownPage = int8_t(g_pages.size());
+      rtcPageShownAt = nowEpoch();
     } else {
       abortPendingImage();
       httpResult = 400;
@@ -723,6 +1070,24 @@ void startUploadServer() {
   xTaskCreatePinnedToCore(serveHttp, "upload-http", 6144, nullptr, 1, nullptr, 1);
 }
 
+// Fast reconnect: the last association's channel and BSSID survive deep
+// sleep in RTC memory, so the next connection skips the scan. Lost on power
+// loss, and dropped after a failed fast attempt.
+RTC_DATA_ATTR uint8_t rtcWifiBssid[6];
+RTC_DATA_ATTR int32_t rtcWifiChannel = 0;
+RTC_DATA_ATTR uint32_t rtcWifiSsidHash = 0;
+String g_wifiSsid;
+String g_wifiPassword;
+bool g_wifiFastAttempt = false;
+constexpr uint32_t kFastConnectMs = 4000;
+
+uint32_t fnv1a(const String &text) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < text.length(); ++i)
+    hash = (hash ^ uint8_t(text[i])) * 16777619u;
+  return hash;
+}
+
 bool beginSavedWifi() {
   Preferences preferences;
   if (!preferences.begin("wificaptive", true)) return false;
@@ -740,16 +1105,37 @@ bool beginSavedWifi() {
   // associated with a station that no longer answered ARP.
   WiFi.setSleep(false);
   WiFi.setHostname(g_board->hostname());
-  WiFi.begin(ssid.c_str(), password.c_str());
+  g_wifiSsid = ssid;
+  g_wifiPassword = password;
+  g_wifiFastAttempt = rtcWifiChannel > 0 && rtcWifiSsidHash == fnv1a(ssid);
+  if (g_wifiFastAttempt)
+    WiFi.begin(ssid.c_str(), password.c_str(), rtcWifiChannel, rtcWifiBssid);
+  else
+    WiFi.begin(ssid.c_str(), password.c_str());
   return true;
 }
 
 bool waitForWifi(uint32_t timeoutMs) {
-  const uint32_t deadline = millis() + timeoutMs;
+  const uint32_t started = millis();
+  const uint32_t deadline = started + timeoutMs;
   while (WiFi.status() != WL_CONNECTED && int32_t(deadline - millis()) > 0) {
-    delay(100);
+    if (g_wifiFastAttempt && millis() - started > kFastConnectMs) {
+      // The cached access point did not answer (moved channel, roamed, or
+      // gone): forget it and scan like a cold start.
+      Serial.println("Fast Wi-Fi reconnect failed; scanning");
+      g_wifiFastAttempt = false;
+      rtcWifiChannel = 0;
+      WiFi.disconnect();
+      WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
+    }
+    delay(20);
   }
-  return WiFi.status() == WL_CONNECTED;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  rtcWifiChannel = WiFi.channel();
+  memcpy(rtcWifiBssid, WiFi.BSSID(), sizeof(rtcWifiBssid));
+  rtcWifiSsidHash = fnv1a(g_wifiSsid);
+  mark(g_wifiFastAttempt ? "wifi-fast" : "wifi-scan");
+  return true;
 }
 
 bool connectSavedWifi() {
@@ -763,6 +1149,7 @@ bool provisionWifi() {
            static_cast<unsigned long>(chip & 0xffffff));
   const String apName = String(g_board->hostname()) + "-" + suffix;
   const String apPassword = makeToken().substring(0, 12);
+  notePanelShowsSavedImage(false);
   g_board->drawProvisionScreen(apName, apPassword);
 
   WiFi.mode(WIFI_AP_STA);
@@ -852,7 +1239,9 @@ void runUploadSession() {
   startUploadServer();
   Serial.print("UPLOAD API http://");
   Serial.println(WiFi.localIP());
+  notePanelShowsSavedImage(false);
   g_board->drawUploadScreen(qrUrl);
+  mark("qr");
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi dropped during panel refresh; reconnecting");
     WiFi.reconnect();
@@ -946,10 +1335,15 @@ String mqttCmdTopic;
 String mqttSetWakeTopic;
 String mqttStateTopic;
 String mqttEventTopic;
+String mqttScheduleTopic;
+String mqttSyncTopic;
+bool pendingSyncSeen = false;
 String pendingCmdPayload;
 String pendingWakePayload;
+String pendingSchedulePayload;
 bool pendingCmdSeen = false;
 bool pendingWakeSeen = false;
+bool pendingScheduleSeen = false;
 
 // The AP-name suffix scheme: stable across reflashes, unique per unit.
 String haDeviceId() {
@@ -970,6 +1364,11 @@ void onMqttMessage(char *topic, uint8_t *payload, unsigned int length) {
   } else if (mqttSetWakeTopic == topic) {
     pendingWakePayload = value;
     pendingWakeSeen = true;
+  } else if (mqttScheduleTopic == topic) {
+    pendingSchedulePayload = value;
+    pendingScheduleSeen = true;
+  } else if (mqttSyncTopic == topic) {
+    pendingSyncSeen = true;
   }
 }
 
@@ -1015,9 +1414,11 @@ String haDiscoveryPayload(const String &id) {
     component["state_topic"] = mqttStateTopic;
     if (diagnostic) component["entity_category"] = "diagnostic";
     // Retained state persists across HA restarts; expiry marks the device
-    // unavailable when it misses two consecutive check-ins.
+    // unavailable when it misses the next check-in by a full interval, also
+    // across the longest scheduled gap (quiet hours).
     if (g_haConfig.wakeMinutes > 0)
-      component["expire_after"] = g_haConfig.wakeMinutes * 60 * 2 + 300;
+      component["expire_after"] =
+          longestPlannedGapSeconds() + g_haConfig.wakeMinutes * 60 + 300;
   };
   sensor("battery", "Battery", "battery", "%",
          "{{ value_json.battery_pct }}", false);
@@ -1028,6 +1429,16 @@ String haDiscoveryPayload(const String &id) {
   sensor("wake", "Wake reason", nullptr, nullptr, "{{ value_json.wake }}",
          true);
   sensor("ip", "IP address", nullptr, nullptr, "{{ value_json.ip }}", true);
+  sensor("next_wake", "Next wake", "timestamp", nullptr,
+         "{{ value_json.next_wake_iso | default(None) }}", true);
+
+  JsonObject stale = components["stale"].to<JsonObject>();
+  stale["platform"] = "binary_sensor";
+  stale["unique_id"] = id + "_stale";
+  stale["name"] = "Image out of date";
+  stale["device_class"] = "problem";
+  stale["state_topic"] = mqttStateTopic;
+  stale["value_template"] = "{{ 'ON' if value_json.stale else 'OFF' }}";
 
   JsonObject interval = components["wake_interval"].to<JsonObject>();
   interval["platform"] = "number";
@@ -1054,7 +1465,8 @@ String haDiscoveryPayload(const String &id) {
 // POST /api/image) and displays it, mirroring the HTTP upload path's SPIFFS
 // pending/commit sequence. The optional sha256 is verified before the panel
 // refreshes or the image is committed.
-bool fetchAndDisplayImage(const String &url, const String &sha256Hex) {
+bool fetchAndDisplayImage(const String &url, const String &sha256Hex,
+                          uint32_t issued) {
   HTTPClient http;
   if (!url.startsWith("http://") || !http.begin(url)) {
     Serial.println("Image command rejected: only http:// URLs are supported");
@@ -1130,11 +1542,324 @@ bool fetchAndDisplayImage(const String &url, const String &sha256Hex) {
     return false;
   }
   if (!commitPendingImage()) return false;
+  notePanelImage(true, wantHash ? sha256Hex : String(), issued);
+  rtcShownPage = -1;  // a single image, outside any page set
   Serial.println("MQTT image received; refreshing display");
   g_board->refresh();
   g_board->hibernate();
   g_panelHibernated = true;
   Serial.println("MQTT image displayed");
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Pages: named full-screen images from a `pages` command, stored as
+// /pg-<name>.bin with their sha256 in NVS. The first is the home view and
+// also becomes the saved image, so restore and staleness logic see it like
+// any server image. A manually uploaded photo is kept as /photo.bin and
+// offered as a last, local "Foto" page.
+
+
+String pagePath(const String &name) { return "/pg-" + name + ".bin"; }
+
+void loadPages() {
+  g_pages.clear();
+  Preferences preferences;
+  if (!preferences.begin(kPagesPrefsNamespace, true)) return;
+  const String json = preferences.getString("index", "[]");
+  preferences.end();
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return;
+  for (JsonObject page : doc.as<JsonArray>())
+    g_pages.push_back({page["n"] | "", page["t"] | "", page["s"] | ""});
+}
+
+void savePages() {
+  JsonDocument doc;
+  JsonArray list = doc.to<JsonArray>();
+  for (const Page &page : g_pages) {
+    JsonObject entry = list.add<JsonObject>();
+    entry["n"] = page.name;
+    entry["t"] = page.title;
+    entry["s"] = page.sha256;
+  }
+  String json;
+  serializeJson(doc, json);
+  Preferences preferences;
+  if (!preferences.begin(kPagesPrefsNamespace, false)) return;
+  preferences.putString("index", json);
+  preferences.end();
+}
+
+bool validPageName(const String &name) {
+  if (name.isEmpty() || name.length() > 12 || name == "photo") return false;
+  for (char c : name)
+    if (!(isdigit(c) || (c >= 'a' && c <= 'z') || c == '-')) return false;
+  return true;
+}
+
+// Downloads one packed framebuffer into `path` (via a temp file), checking
+// the mandatory sha256; the panel is not touched.
+bool fetchToFile(const String &url, const String &sha256Hex, const String &path) {
+  if (!imageStorageReady || sha256Hex.length() != 64) return false;
+  HTTPClient http;
+  if (!url.startsWith("http://") || !http.begin(url)) return false;
+  http.setTimeout(15000);
+  if (http.GET() != HTTP_CODE_OK || http.getSize() != int(g_geometry.imageBytes())) {
+    http.end();
+    return false;
+  }
+  const String temp = path + ".tmp";
+  File file = SPIFFS.open(temp, FILE_WRITE);
+  if (!file) {
+    http.end();
+    return false;
+  }
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts_ret(&sha, 0);
+  WiFiClient &stream = http.getStream();
+  stream.setTimeout(15000);
+  bool ok = true;
+  for (int16_t y = 0; y < g_geometry.height && ok; ++y) {
+    ok = stream.readBytes(mainRow, g_geometry.rowBytes) == g_geometry.rowBytes &&
+         file.write(mainRow, g_geometry.rowBytes) == g_geometry.rowBytes;
+    if (ok) mbedtls_sha256_update_ret(&sha, mainRow, g_geometry.rowBytes);
+    if ((y % 100) == 99) mqtt.loop();
+  }
+  http.end();
+  file.close();
+  uint8_t digest[32];
+  mbedtls_sha256_finish_ret(&sha, digest);
+  mbedtls_sha256_free(&sha);
+  char hex[65];
+  for (size_t i = 0; i < 32; ++i) snprintf(hex + i * 2, 3, "%02x", digest[i]);
+  String expected = sha256Hex;
+  expected.toLowerCase();
+  if (!ok || expected != hex) {
+    SPIFFS.remove(temp);
+    return false;
+  }
+  SPIFFS.remove(path);
+  return SPIFFS.rename(temp, path);
+}
+
+// Shows a stored image file and makes it the saved image (full refresh).
+bool displayFile(const char *path) {
+  File file = SPIFFS.open(path, FILE_READ);
+  if (!file || file.size() != g_geometry.imageBytes() || !beginPendingImage()) {
+    if (file) file.close();
+    return false;
+  }
+  bool ok = true;
+  for (int16_t y = 0; y < g_geometry.height && ok; ++y) {
+    ok = file.read(mainRow, g_geometry.rowBytes) == g_geometry.rowBytes &&
+         pendingImage.write(mainRow, g_geometry.rowBytes) == g_geometry.rowBytes;
+    if (ok) g_board->writeRow(mainRow, y);
+  }
+  file.close();
+  if (!ok || !commitPendingImage()) {
+    abortPendingImage();
+    return false;
+  }
+  g_board->refresh();
+  g_board->hibernate();
+  g_panelHibernated = true;
+  return true;
+}
+
+bool copyFile(const char *from, const char *to) {
+  File in = SPIFFS.open(from, FILE_READ);
+  File out = SPIFFS.open(to, FILE_WRITE);
+  bool ok = in && out;
+  while (ok && in.available()) {
+    const size_t got = in.read(mainRow, g_geometry.rowBytes);
+    ok = out.write(mainRow, got) == got;
+  }
+  if (in) in.close();
+  if (out) out.close();
+  return ok;
+}
+
+// Shows the home page (page 0) again if the panel shows another view and
+// the last flip is at least `minAgeSeconds` old. Returns true when it drew.
+bool returnHome(uint32_t minAgeSeconds) {
+  if (g_pages.empty() || rtcShownPage == 0) return false;
+  const uint32_t now = nowEpoch();
+  if (minAgeSeconds && now && rtcPageShownAt && now - rtcPageShownAt < minAgeSeconds)
+    return false;
+  if (!displayFile(pagePath(g_pages[0].name).c_str())) return false;
+  notePanelImage(true, g_pages[0].sha256, g_panel.issued);
+  rtcShownPage = 0;
+  Serial.println("Home view restored");
+  return true;
+}
+
+// The `pages` command: fetch what changed, drop what is gone, show page 0
+// when it is new or another view is up.
+bool applyPages(JsonArray list, uint32_t issued, String &detail) {
+  std::vector<Page> next;
+  std::vector<std::pair<String, String>> urls;
+  for (JsonObject entry : list) {
+    if (next.size() >= kMaxPages) break;
+    Page page{entry["name"] | "", entry["title"] | "", entry["sha256"] | ""};
+    page.sha256.toLowerCase();
+    if (!validPageName(page.name) || page.sha256.length() != 64) {
+      detail = "bad page entry";
+      return false;
+    }
+    next.push_back(page);
+    urls.push_back({page.name, entry["url"] | ""});
+  }
+  if (next.empty()) {
+    detail = "no pages";
+    return false;
+  }
+  int fetched = 0;
+  for (size_t i = 0; i < next.size(); ++i) {
+    const Page &page = next[i];
+    const auto known = std::find_if(g_pages.begin(), g_pages.end(),
+                                    [&](const Page &p) { return p.name == page.name; });
+    if (known != g_pages.end() && known->sha256 == page.sha256 &&
+        SPIFFS.exists(pagePath(page.name)))
+      continue;
+    if (!fetchToFile(urls[i].second, page.sha256, pagePath(page.name))) {
+      detail = "fetch failed: " + page.name;
+      return false;
+    }
+    ++fetched;
+  }
+  for (const Page &old : g_pages) {
+    if (std::none_of(next.begin(), next.end(),
+                     [&](const Page &p) { return p.name == old.name; }))
+      SPIFFS.remove(pagePath(old.name));
+  }
+  g_pages = next;
+  savePages();
+  bool shown = false;
+  // Someone flipped to another view a moment ago: let them look; the home
+  // view returns on a later timer wake (returnHome).
+  const uint32_t now = nowEpoch();
+  const bool browsing = rtcShownPage > 0 && now && rtcPageShownAt &&
+                        now - rtcPageShownAt < kReturnHomeSeconds;
+  if (!browsing &&
+      (!g_panel.fromServer || g_panel.sha256 != g_pages[0].sha256 || rtcShownPage != 0)) {
+    shown = displayFile(pagePath(g_pages[0].name).c_str());
+    if (shown) {
+      notePanelImage(true, g_pages[0].sha256, issued);
+      rtcShownPage = 0;
+    }
+  }
+  detail = "fetched " + String(fetched) + " of " + String(g_pages.size()) +
+           (shown ? ", home shown" : "");
+  return true;
+}
+
+// Status of the last successful check-in, for the board's status screen.
+void persistCheckinStatus() {
+  Preferences preferences;
+  if (!preferences.begin("reterm-status", false)) return;
+  preferences.putUInt("last", nowEpoch());
+  preferences.putInt("rssi", WiFi.RSSI());
+  preferences.putString("ssid", WiFi.SSID());
+  preferences.putString("ip", WiFi.localIP().toString());
+  preferences.end();
+}
+
+// Streams a firmware image into the inactive OTA slot. The sha256 is
+// mandatory and checked before the slot becomes bootable. The bootloader
+// boots the new image once in "pending verify"; confirmFirmware() keeps it
+// only after its first successful check-in, so a firmware that crashes or
+// cannot reach the broker falls back to the previous one on the next boot.
+bool fetchAndInstallFirmware(const String &url, const String &sha256Hex,
+                             String &detail) {
+  if (sha256Hex.length() != 64) {
+    detail = "sha256 required";
+    return false;
+  }
+  HTTPClient http;
+  if (!url.startsWith("http://") || !http.begin(url)) {
+    detail = "only http:// urls";
+    return false;
+  }
+  http.setTimeout(15000);
+  const int code = http.GET();
+  const int length = http.getSize();
+  if (code != HTTP_CODE_OK || length <= 0 || size_t(length) > kMaxFirmwareBytes) {
+    detail = "fetch failed: http " + String(code) + ", bytes " + String(length);
+    http.end();
+    return false;
+  }
+  if (!Update.begin(size_t(length), U_FLASH)) {
+    detail = String("update begin: ") + Update.errorString();
+    http.end();
+    return false;
+  }
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts_ret(&sha, 0);
+  WiFiClient &stream = http.getStream();
+  stream.setTimeout(15000);
+  static uint8_t chunk[4096];
+  size_t remaining = size_t(length);
+  bool ok = true;
+  uint32_t lastService = millis();
+  while (remaining && ok) {
+    const size_t want = min(remaining, sizeof(chunk));
+    const size_t got = stream.readBytes(chunk, want);
+    if (got != want || Update.write(chunk, got) != got) {
+      detail = got != want ? "short read" : String("write: ") + Update.errorString();
+      ok = false;
+      break;
+    }
+    mbedtls_sha256_update_ret(&sha, chunk, got);
+    remaining -= got;
+    if (millis() - lastService > 1000) {
+      mqtt.loop();  // a multi-megabyte body outlasts the keepalive
+      lastService = millis();
+    }
+  }
+  http.end();
+  uint8_t digest[32];
+  mbedtls_sha256_finish_ret(&sha, digest);
+  mbedtls_sha256_free(&sha);
+  if (ok) {
+    char hex[65];
+    static constexpr char alphabet[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+      hex[i * 2] = alphabet[digest[i] >> 4];
+      hex[i * 2 + 1] = alphabet[digest[i] & 0x0f];
+    }
+    hex[64] = 0;
+    String expected = sha256Hex;
+    expected.toLowerCase();
+    if (expected != hex) {
+      detail = "sha256 mismatch";
+      ok = false;
+    }
+  }
+  if (!ok) {
+    Update.abort();
+    return false;
+  }
+  if (!Update.end()) {
+    detail = String("update end: ") + Update.errorString();
+    return false;
+  }
+  detail = "installed " + String(length) + " bytes; rebooting";
+  return true;
+}
+
+// Keeps a freshly installed firmware (see fetchAndInstallFirmware). Returns
+// true when this boot was the one under verification.
+bool confirmFirmware() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state;
+  if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK ||
+      state != ESP_OTA_IMG_PENDING_VERIFY)
+    return false;
+  esp_ota_mark_app_valid_cancel_rollback();
+  Serial.println("Firmware confirmed after a successful check-in");
   return true;
 }
 
@@ -1159,7 +1884,8 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
   if (action == "image") {
     const String url = doc["url"] | "";
     const String sha = doc["sha256"] | "";
-    const bool ok = url.length() && fetchAndDisplayImage(url, sha);
+    const bool ok =
+        url.length() && fetchAndDisplayImage(url, sha, doc["issued"] | 0u);
     if (commandId.length()) storeLastCommandId(commandId);
     clearRetained(mqttCmdTopic);
     publishEvent(String("{\"event\":\"image\",\"ok\":") +
@@ -1191,6 +1917,47 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
                  ",\"ssid\":\"" + ssid + "\",\"id\":\"" + commandId + "\"}");
     Serial.println(ok ? "Wi-Fi credentials updated over MQTT; applied on next connection"
                       : "Wi-Fi command rejected: invalid credentials");
+    return CommandOutcome::Handled;
+  }
+  if (action == "pages") {
+    String detail;
+    const bool ok = applyPages(doc["pages"].as<JsonArray>(), doc["issued"] | 0u, detail);
+    if (commandId.length()) storeLastCommandId(commandId);
+    clearRetained(mqttCmdTopic);
+    detail.replace("\"", "'");
+    publishEvent(String("{\"event\":\"pages\",\"ok\":") + (ok ? "true" : "false") +
+                 ",\"detail\":\"" + detail + "\",\"id\":\"" + commandId + "\"}");
+    return CommandOutcome::Handled;
+  }
+  if (action == "ota") {
+    // Record and clear first: a retained duplicate must never re-flash.
+    if (commandId.length()) storeLastCommandId(commandId);
+    clearRetained(mqttCmdTopic);
+    const String version = doc["version"] | "";
+    String detail;
+    bool ok;
+    if (version.length() && version == RETERM_FW_VERSION) {
+      ok = true;
+      detail = "already running " + version;
+    } else {
+      ok = fetchAndInstallFirmware(doc["url"] | "", doc["sha256"] | "", detail);
+    }
+    detail.replace("\"", "'");
+    publishEvent(String("{\"event\":\"ota\",\"ok\":") + (ok ? "true" : "false") +
+                 ",\"detail\":\"" + detail + "\",\"id\":\"" + commandId + "\"}");
+    Serial.print("OTA: ");
+    Serial.println(detail);
+    if (ok && !(version.length() && version == RETERM_FW_VERSION)) {
+      const uint32_t drain = millis() + 500;
+      while (int32_t(drain - millis()) > 0) {
+        mqtt.loop();
+        delay(10);
+      }
+      mqtt.disconnect();
+      if (!g_panelHibernated) g_board->hibernate();
+      Serial.flush();
+      ESP.restart();
+    }
     return CommandOutcome::Handled;
   }
   if (action == "session") {
@@ -1238,6 +2005,7 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
 // Returns true when a retained session command asks for a full upload
 // session; the caller runs it after the MQTT connection is torn down.
 bool runHaCheckin(bool allowSession) {
+  g_checkinOk = false;
   if (!g_haConfig.enabled()) return false;
   if (WiFi.status() != WL_CONNECTED && !connectSavedWifi()) {
     Serial.println("Check-in skipped: Wi-Fi unavailable");
@@ -1249,7 +2017,10 @@ bool runHaCheckin(bool allowSession) {
   mqttCmdTopic = "reterm/" + id + "/cmd";
   mqttSetWakeTopic = "reterm/" + id + "/set/wake-interval";
   mqttEventTopic = "reterm/" + id + "/event";
-  pendingCmdSeen = pendingWakeSeen = false;
+  mqttScheduleTopic = "reterm/" + id + "/schedule";
+  mqttSyncTopic = "reterm/" + id + "/sync";
+  pendingCmdSeen = pendingWakeSeen = pendingScheduleSeen = pendingSyncSeen = false;
+  syncClock();
 
   mqtt.setServer(g_haConfig.host.c_str(), g_haConfig.port);
   mqtt.setBufferSize(4096);
@@ -1266,15 +2037,29 @@ bool runHaCheckin(bool allowSession) {
     return false;
   }
   Serial.println("MQTT connected; publishing state and reading commands");
+  mark("mqtt");
+  g_checkinOk = true;
 
   mqtt.subscribe(mqttCmdTopic.c_str());
   mqtt.subscribe(mqttSetWakeTopic.c_str());
-  // Retained messages arrive right after SUBACK; a short poll collects them.
+  mqtt.subscribe(mqttScheduleTopic.c_str());
+  mqtt.subscribe(mqttSyncTopic.c_str());
+  // The broker sends each subscription's retained message right after its
+  // SUBACK, in order, so a message published to our own sync topic after
+  // the subscriptions arrives behind all of them: then everything is in.
+  // The deadline covers a broker that drops it.
+  mqtt.publish(mqttSyncTopic.c_str(), "1", false);
   const uint32_t retainedDeadline = millis() + 3000;
-  while (int32_t(retainedDeadline - millis()) > 0) {
+  while (!pendingSyncSeen && int32_t(retainedDeadline - millis()) > 0) {
     mqtt.loop();
-    delay(10);
+    delay(5);
   }
+  mark(pendingSyncSeen ? "retained" : "ret-tmout");
+  persistCheckinStatus();
+
+  // The schedule stays retained: it is the server's standing plan.
+  if (pendingScheduleSeen && pendingSchedulePayload.length())
+    storeSchedule(pendingSchedulePayload);
 
   // Apply a pending interval change first so the discovery expiry and the
   // state below already reflect it, then consume the retained value.
@@ -1295,15 +2080,30 @@ bool runHaCheckin(bool allowSession) {
                haDiscoveryPayload(id).c_str(), true);
   mqtt.publish(mqttStateTopic.c_str(), haStatePayload().c_str(), true);
 
-  CommandOutcome outcome = CommandOutcome::None;
-  if (pendingCmdSeen && pendingCmdPayload.length()) {
-    outcome = processCommand(pendingCmdPayload, allowSession);
-    if (outcome == CommandOutcome::Handled) {
-      // The command may have taken a while (image fetch + refresh); leave a
-      // fresh retained state behind.
-      mqtt.publish(mqttStateTopic.c_str(), haStatePayload().c_str(), true);
+  if (g_markCount) {
+    // [name, ms since that boot, boot number]; each boot starts with a mark
+    // named after its wake reason.
+    String json = "{\"event\":\"timing\",\"marks\":[";
+    for (size_t i = 0; i < min<size_t>(g_markCount, kMaxMarks); ++i) {
+      if (i) json += ",";
+      json += "[\"" + String(g_marks[i].name) + "\"," + String(g_marks[i].ms) +
+              "," + String(g_marks[i].boot) + "]";
     }
+    json += "]}";
+    publishEvent(json);
+    g_markCount = 0;
   }
+  if (confirmFirmware())
+    publishEvent("{\"event\":\"ota\",\"ok\":true,\"detail\":\"confirmed " RETERM_FW_VERSION "\"}");
+
+  CommandOutcome outcome = CommandOutcome::None;
+  if (pendingCmdSeen && pendingCmdPayload.length())
+    outcome = processCommand(pendingCmdPayload, allowSession);
+  if (updateBadge()) g_panelHibernated = true;
+  g_badgeChecked = true;
+  // Commands and the badge may have changed what the state reports; leave a
+  // fresh retained state behind.
+  mqtt.publish(mqttStateTopic.c_str(), haStatePayload().c_str(), true);
 
   const uint32_t drainDeadline = millis() + 200;
   while (int32_t(drainDeadline - millis()) > 0) {
@@ -1315,6 +2115,30 @@ bool runHaCheckin(bool allowSession) {
 }
 
 }  // namespace
+
+void mark(const char *name) {
+  static bool started = false;  // the first mark of a boot opens it
+  if (!started) {
+    started = true;
+    ++g_bootCount;
+  }
+  if (g_markCount >= kMaxMarks) return;
+  Mark &entry = g_marks[g_markCount++];
+  strlcpy(entry.name, name, sizeof(entry.name));
+  entry.ms = millis();
+  entry.boot = g_bootCount;
+}
+
+void notePanelShowsSavedImage(bool shows) {
+  Preferences preferences;
+  if (preferences.begin(kSchedPrefsNamespace, false)) {
+    preferences.putBool("clean", shows);
+    if (shows) preferences.putBool("badge", false);
+    preferences.end();
+  }
+  g_panel.clean = shows;
+  if (shows) g_panel.badge = false;
+}
 
 String makeToken() {
   uint8_t random[16];
@@ -1329,7 +2153,12 @@ String makeToken() {
   return String(encoded);
 }
 
-void run(Board &board) {
+bool g_begun = false;
+
+void begin(Board &board) {
+  if (g_begun) return;
+  g_begun = true;
+  mark(wakeReason());
   g_board = &board;
   g_geometry = board.geometry();
   httpRow = new uint8_t[g_geometry.rowBytes];
@@ -1339,17 +2168,101 @@ void run(Board &board) {
   Serial.print("Battery mV = ");
   Serial.println(g_batteryMv);
   loadHaConfig();
+  loadPanelState();
+  // Without a broker there is no check-in to prove a new firmware healthy.
+  if (!g_haConfig.enabled()) confirmFirmware();
 
   imageStorageReady = SPIFFS.begin(true);
   Serial.print("Image storage ready = ");
   Serial.println(imageStorageReady ? "yes" : "no");
+  loadPages();
+  // RTC memory is lost on power-up; the panel shows page 0 when the saved
+  // server image is it.
+  if (rtcShownPage < 0 && !g_pages.empty() && g_panel.fromServer &&
+      g_panel.sha256 == g_pages[0].sha256)
+    rtcShownPage = 0;
+}
+
+size_t pageCount() {
+  return g_pages.size() + (imageStorageReady && SPIFFS.exists(kPhotoPath) ? 1 : 0);
+}
+
+String pageTitle(size_t index) {
+  if (index < g_pages.size())
+    return g_pages[index].title.length() ? g_pages[index].title : g_pages[index].name;
+  return index < pageCount() ? "Foto" : "";
+}
+
+bool readPage(size_t index, uint8_t *buffer) {
+  if (index >= pageCount()) return false;
+  const String path = index < g_pages.size() ? pagePath(g_pages[index].name) : String(kPhotoPath);
+  File file = SPIFFS.open(path, FILE_READ);
+  const bool ok = file && file.size() == g_geometry.imageBytes() &&
+                  file.read(buffer, g_geometry.imageBytes()) == g_geometry.imageBytes();
+  if (file) file.close();
+  return ok;
+}
+
+int shownPage() { return rtcShownPage; }
+
+void notePageShown(size_t index) {
+  rtcShownPage = int8_t(index);
+  rtcPageShownAt = nowEpoch();
+  if (index == 0 && !g_pages.empty()) {
+    // Home is the saved image again (a manual upload may have replaced it),
+    // so restores and the staleness badge refer to it.
+    if (copyFile(pagePath(g_pages[0].name).c_str(), kSavedImagePath))
+      notePanelImage(true, g_pages[0].sha256, g_panel.issued);
+  } else {
+    notePanelShowsSavedImage(false);
+  }
+}
+
+Status status() {
+  Status out{};
+  out.batteryMv = g_batteryMv;
+  out.batteryPct = batteryPercent(g_batteryMv);
+  Preferences preferences;
+  if (preferences.begin("reterm-status", true)) {
+    out.lastCheckin = preferences.getUInt("last", 0);
+    out.rssi = preferences.getInt("rssi", 0);
+    out.ssid = preferences.getString("ssid", "");
+    out.ip = preferences.getString("ip", "");
+    preferences.end();
+  }
+  plannedSleepSeconds(&out.nextWake);
+  out.issued = g_panel.issued;
+  out.clock = clockValid();
+  out.stale = panelStale();
+  out.serverImage = g_panel.fromServer;
+  out.wakeMinutes = g_haConfig.wakeMinutes;
+  out.brokerConfigured = g_haConfig.enabled();
+  out.firmware = RETERM_FW_VERSION;
+  return out;
+}
+
+bool checkInNow(bool &changed) {
+  const String before = g_panel.sha256;
+  const int shownBefore = rtcShownPage;
+  runHaCheckin(false);
+  changed = g_panel.sha256 != before || rtcShownPage != shownBefore;
+  return g_checkinOk;
+}
+
+void run(Board &board) {
+  begin(board);
 
   // A timer wake exists only for the Home Assistant check-in: publish stats,
   // apply whatever HA left on the retained command topics, sleep again. The
   // panel is untouched unless a command replaced the image.
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
     Serial.println("Timer wake: Home Assistant check-in");
-    if (runHaCheckin(true)) {
+    const bool session = runHaCheckin(true);
+    // Another view has been up for a while: back to the home page.
+    if (returnHome(kReturnHomeSeconds)) g_badgeChecked = false;
+    // Also when the check-in failed: a stale image is exactly that case.
+    if (!g_badgeChecked && updateBadge()) g_panelHibernated = true;
+    if (session) {
       runSessionAndMenu();
     } else if (!g_panelHibernated) {
       // setup() reset the panel controller; park it again like the
@@ -1366,8 +2279,13 @@ void run(Board &board) {
   }
   // A physical wake is unambiguous and should react immediately. Retain the
   // three-second UART recovery window only for reset/power-on host workflows.
-  const StartupCommand command =
-      buttonWake ? StartupCommand::None : receiveStartupCommand();
+  // The UART window serves the workbench tools after a reset or power-on;
+  // any wake from deep sleep skips it.
+  const bool sleepWake =
+      esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED;
+  const StartupCommand command = buttonWake || sleepWake
+                                     ? StartupCommand::None
+                                     : receiveStartupCommand();
   if (command == StartupCommand::Image) goToSleep();
   if (command == StartupCommand::Web || buttonWake) {
     runSessionAndMenu();
@@ -1377,9 +2295,26 @@ void run(Board &board) {
     goToSleep();
   }
 
+  // Power-on or reset (including the reboot after an OTA install): check in
+  // right away rather than waiting a full interval, which also confirms a
+  // freshly installed firmware.
   Serial.println("No host command; preserving the current panel image");
-  board.hibernate();
+  // Board-handled button wakes (page flips, menus) end here without Wi-Fi;
+  // their marks wait in RTC memory for the next check-in.
+  if (g_haConfig.enabled() && !sleepWake) {
+    if (runHaCheckin(true)) {
+      runSessionAndMenu();
+      goToSleep();
+    }
+    if (!g_badgeChecked && updateBadge()) g_panelHibernated = true;
+  }
+  if (!g_panelHibernated) board.hibernate();
   goToSleep();
 }
 
 }  // namespace reterm
+
+// Arduino marks every boot's firmware valid unless this hook says otherwise;
+// the runtime confirms after a successful check-in instead (see
+// confirmFirmware), so the rollback-enabled bootloader can undo a bad OTA.
+extern "C" bool verifyRollbackLater() { return true; }

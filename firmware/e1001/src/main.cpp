@@ -17,6 +17,13 @@
 #include <esp_sleep.h>
 #include <qrcode.h>
 #include <reterm.h>
+
+#include <vector>
+
+#include "fonts/UiBody.h"
+#include "fonts/UiBold.h"
+#include "fonts/UiSmall.h"
+#include "fonts/UiTitle.h"
 #include <soc/gpio_sd_reg.h>
 #include <soc/soc.h>
 
@@ -33,6 +40,13 @@ constexpr int kBusy = 13;
 // 8.8 / 9.7 / 10.3 cm, i.e. screen columns 440 / 485 / 515). The green
 // button stays the EXT0 photo-session wake like the stock firmware; the two
 // white buttons are an EXT1 wake into the arcade.
+// The UC8179 takes 10 MHz SPI (the games and video always ran at it): a full
+// 48 KB plane goes over in ~40 ms instead of ~190 ms at the old 2 MHz.
+constexpr uint32_t kPanelSpiHz = 10000000;
+// Status LED: lit from a button wake until the screen shows the answer.
+// Polarity per the board's LED wiring.
+constexpr int kLedPin = 6;
+constexpr bool kLedActiveLow = true;
 constexpr gpio_num_t kGreenButton = GPIO_NUM_3;
 constexpr int kLeftButton = 5;
 constexpr int kRightButton = 4;
@@ -411,8 +425,8 @@ constexpr const char *kWinReasons[] = {"Rock blunts scissors",
 // Screen columns under the measured button cap centers, and the wider fan
 // the legend icons spread to so they stay readable (the caps sit only 45
 // and 30 px apart).
-constexpr int16_t kBtnCols[] = {440, 485, 515};
-constexpr int16_t kLegendCols[] = {400, 485, 570};
+constexpr int16_t kBtnCols[] = {450, 493, 545};  // measured on screen, 2026-10-18
+constexpr int16_t kLegendCols[] = {398, 493, 588};
 
 struct RpsScore {
   uint32_t wins = 0;
@@ -950,7 +964,7 @@ void buildGameScripts() {
 
 // Stock full refresh of a canvas frame; also flushes fast-mode ghosting.
 void showCanvas(const uint8_t *screen) {
-  display.epd2.selectSPI(epaperSpi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  display.epd2.selectSPI(epaperSpi, SPISettings(kPanelSpiHz, MSBFIRST, SPI_MODE0));
   display.init(115200);
   display.setRotation(0);
   display.epd2.writeNative(screen, nullptr, 0, 0, 800, 480, false, false,
@@ -1178,11 +1192,13 @@ bool restoreSavedPhoto() {
   }
   file.close();
   display.epd2.refresh(false);
+  reterm::notePanelShowsSavedImage(true);
   Serial.println("Saved photo restored");
   return true;
 }
 
 void drawPetScreen(const PetState &pet) {
+  reterm::notePanelShowsSavedImage(false);
   const PetStage stage = petStage(pet);
   const char *title = "LUNA THE UNICORN";
   const char *stageName = "UNICORN";
@@ -1467,6 +1483,7 @@ bool connectVideoWifi() {
 }
 
 bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
+  reterm::notePanelShowsSavedImage(false);
   if (WiFi.status() != WL_CONNECTED && !connectVideoWifi()) {
     detail = "wifi unavailable";
     return false;
@@ -1747,7 +1764,7 @@ bool playVideo(const String &url, String &detail, void (*serviceNetwork)()) {
   // ghosting; the saved photo only returns via the menu or a new upload.
   // Early failures fall back to the photo (or a clear) instead of leaving
   // a half-written panel behind.
-  display.epd2.selectSPI(epaperSpi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  display.epd2.selectSPI(epaperSpi, SPISettings(kPanelSpiHz, MSBFIRST, SPI_MODE0));
   display.init(115200);
   display.setRotation(0);
   if (shown > 1) {
@@ -1798,102 +1815,658 @@ bool playLastVideo() {
   return true;
 }
 
-// --- Arcade menu -----------------------------------------------------------
+// --- Menu and views --------------------------------------------------------
+// Content first: the white buttons flip between the stored views (pages) of
+// the calendar, a green tap opens the menu. The menu is drawn into an
+// off-screen canvas with the generated UI fonts; screen changes are calm
+// stock partial refreshes seeded from that canvas, row steps the games' fast
+// waveform on just the affected rows.
 
-void drawMenuScreen(int selected) {
-  static constexpr const char *entries[] = {
-      "ROCK PAPER SCISSORS", "LUNA THE UNICORN", "SEND A PHOTO",
-      "BACK TO THE PHOTO", "BAD APPLE"};
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
-    centeredText("RETERM ARCADE", 20, 4);
-    for (int entry = 0; entry < 5; ++entry) {
-      const int16_t y = 78 + entry * 70;
-      if (entry == selected) {
-        display.fillRoundRect(150, y, 510, 58, 12, GxEPD_BLACK);
-        display.setTextColor(GxEPD_WHITE);
-      } else {
-        display.drawRoundRect(150, y, 510, 58, 12, GxEPD_BLACK);
-        display.drawRoundRect(151, y + 1, 508, 56, 12, GxEPD_BLACK);
-      }
-      cellText(entries[entry], 405, y + 17, 3);
-      display.setTextColor(GxEPD_BLACK);
-      if (entry == 0) {
-        drawScissorsIcon(display, 110, y + 29, 48);
-      } else if (entry == 1) {
-        drawSprite(kSpriteUnicorn, 88, y + 5, 3);
-      } else if (entry == 2) {
-        // The photo frame with an up arrow: send a new photo to the frame.
-        drawSprite(kSpriteFrame, 86, y + 5, 3);
-        display.fillTriangle(110, y + 15, 98, y + 29, 122, y + 29, GxEPD_BLACK);
-        display.fillRect(106, y + 29, 9, 12, GxEPD_BLACK);
-      } else if (entry == 3) {
-        drawSprite(kSpriteFrame, 86, y + 5, 3);
-      } else {
-        drawSprite(kSpriteApple, 90, y + 5, 4);
-      }
-    }
-    centeredText("WHITE buttons scroll    GREEN chooses", 436, 2);
-  } while (display.nextPage());
+// Local preferences: sound and the status LED.
+struct UiPrefs {
+  bool sound = true;
+  bool led = true;
+};
+UiPrefs g_ui;
+
+void loadUiPrefs() {
+  Preferences preferences;
+  if (!preferences.begin("reterm-ui", true)) return;
+  g_ui.sound = preferences.getBool("sound", true);
+  g_ui.led = preferences.getBool("led", true);
+  preferences.end();
 }
 
-reterm::MenuAction runArcade() {
-  Serial.println("Arcade menu");
+void saveUiPrefs() {
+  Preferences preferences;
+  if (!preferences.begin("reterm-ui", false)) return;
+  preferences.putBool("sound", g_ui.sound);
+  preferences.putBool("led", g_ui.led);
+  preferences.end();
+}
+
+void setLed(bool on) {
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, (on && g_ui.led) != kLedActiveLow ? HIGH : LOW);
+}
+
+void click() {
+  if (g_ui.sound) sfxPress();
+}
+
+// Back from register-LUT fast mode to the driver's stock waveforms: a reset
+// restores the OTP LUTs, so anything drawn next refreshes as usual.
+void leaveFastMode() {
+  display.epd2.selectSPI(epaperSpi, SPISettings(kPanelSpiHz, MSBFIRST, SPI_MODE0));
+  display.init(115200);
+  display.setRotation(0);
+}
+
+// Stock partial refresh of a whole screen with both RAM planes seeded: no
+// flashing, only changed pixels are driven (~0.45 s).
+void showCalm(const uint8_t *before, const uint8_t *after) {
+  display.epd2.selectSPI(epaperSpi, SPISettings(kPanelSpiHz, MSBFIRST, SPI_MODE0));
+  display.init(115200, false);
+  display.setRotation(0);
+  display.epd2.writeImageToPrevious(before, 0, 0, 800, 480, false, false, false);
+  display.epd2.writeImage(after, 0, 0, 800, 480, false, false, false);
+  display.epd2.refresh(0, 0, 800, 480);
+}
+
+// --- Text in the generated fonts (Latin-1 glyph tables) ---
+
+String latin1(const String &utf8) {
+  String out;
+  out.reserve(utf8.length());
+  for (size_t i = 0; i < utf8.length(); ++i) {
+    const uint8_t c = uint8_t(utf8[i]);
+    if (c < 0x80) {
+      out += char(c);
+    } else if ((c == 0xC2 || c == 0xC3) && i + 1 < utf8.length()) {
+      out += char(((c & 0x03) << 6) | (uint8_t(utf8[++i]) & 0x3F));
+    } else {
+      while (i + 1 < utf8.length() && (uint8_t(utf8[i + 1]) & 0xC0) == 0x80) ++i;
+      out += '?';
+    }
+  }
+  return out;
+}
+
+// Kerning between two Latin-1 characters (binary search; the pairs are
+// sorted by left, then right).
+int8_t kerning(const UiFont &font, uint8_t left, uint8_t right) {
+  int lo = 0, hi = int(font.kerningCount) - 1;
+  const uint16_t key = uint16_t(left) << 8 | right;
+  while (lo <= hi) {
+    const int mid = (lo + hi) / 2;
+    const UiKern &pair = font.kerning[mid];
+    const uint16_t at = uint16_t(pair.left) << 8 | pair.right;
+    if (at == key) return pair.pixels;
+    if (at < key) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return 0;
+}
+
+int16_t textWidth(const UiFont &font, const String &text) {
+  const String raw = latin1(text);
+  const GFXfont &gfx = *font.gfx;
+  int16_t width = 0;
+  for (size_t i = 0; i < raw.length(); ++i) {
+    const uint8_t c = uint8_t(raw[i]);
+    if (c < gfx.first || c > gfx.last) continue;
+    if (i) width += kerning(font, uint8_t(raw[i - 1]), c);
+    width += pgm_read_byte(&gfx.glyph[c - gfx.first].xAdvance);
+  }
+  return width;
+}
+
+enum class Align { Left, Right, Center };
+
+// Draws glyph by glyph so the kerning GFX fonts cannot carry applies.
+void text(Adafruit_GFX &g, const UiFont &font, int16_t x, int16_t baseline,
+          const String &value, uint16_t color, Align align = Align::Left) {
+  const int16_t width = textWidth(font, value);
+  if (align == Align::Right) x -= width;
+  if (align == Align::Center) x -= width / 2;
+  const String raw = latin1(value);
+  g.setFont(font.gfx);
+  g.setTextColor(color);
+  g.setTextWrap(false);
+  g.setCursor(x, baseline);
+  for (size_t i = 0; i < raw.length(); ++i) {
+    if (i) g.setCursor(g.getCursorX() + kerning(font, uint8_t(raw[i - 1]), uint8_t(raw[i])), baseline);
+    g.write(uint8_t(raw[i]));
+  }
+  g.setFont(nullptr);
+}
+
+String clockText(uint32_t epoch, const char *format) {
+  if (!epoch) return "";
+  const time_t at = epoch;
+  struct tm local;
+  localtime_r(&at, &local);
+  char out[24];
+  strftime(out, sizeof(out), format, &local);
+  return out;
+}
+
+// "heute 19:30", "gestern 22:00", "Mo 07:15".
+String whenText(uint32_t epoch) {
+  if (!epoch) return "nie";
+  static constexpr const char *days[] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
+  const time_t at = epoch, now = time(nullptr);
+  struct tm then, today;
+  localtime_r(&at, &then);
+  localtime_r(&now, &today);
+  const String hm = clockText(epoch, "%H:%M");
+  if (then.tm_yday == today.tm_yday && then.tm_year == today.tm_year) return "heute " + hm;
+  if (now - at < 2 * 86400 && (today.tm_yday - then.tm_yday + 365) % 365 == 1)
+    return "gestern " + hm;
+  return String(days[then.tm_wday]) + " " + hm;
+}
+
+// --- Layout ---
+
+constexpr int16_t kRowTop = 78;
+constexpr int16_t kRowH = 50;
+constexpr int kMaxRows = 7;
+// The physical caps along the top edge, measured on screen with a ruler
+// view: left white, right white, green.
+constexpr int16_t kCapX[] = {450, 493, 545};
+
+void drawHeader(Adafruit_GFX &g, const String &title, const String &crumb) {
+  g.fillScreen(GxEPD_WHITE);
+  text(g, UiTitle, 28, 52, title, GxEPD_BLACK);
+  if (crumb.length())
+    text(g, UiSmall, 28 + textWidth(UiTitle, title) + 14, 50, crumb, GxEPD_BLACK);
+  // Button hints hang from the top edge right under their caps.
+  for (int i = 0; i < 3; ++i) {
+    const int16_t x = kCapX[i];
+    g.fillRoundRect(x - 14, -8, 28, 28, 6, GxEPD_BLACK);
+    if (i == 0) g.fillTriangle(x - 6, 12, x + 6, 12, x, 5, GxEPD_WHITE);
+    else if (i == 1) g.fillTriangle(x - 6, 5, x + 6, 5, x, 12, GxEPD_WHITE);
+    else g.fillCircle(x, 8, 4, GxEPD_WHITE);
+  }
+  const reterm::Status st = reterm::status();
+  // Battery and clock at the right.
+  const int16_t bx = 700;
+  g.drawRect(bx, 30, 30, 15, GxEPD_BLACK);
+  g.fillRect(bx + 30, 34, 3, 7, GxEPD_BLACK);
+  g.fillRect(bx + 3, 33, max(1, st.batteryPct * 24 / 100), 9, GxEPD_BLACK);
+  text(g, UiSmall, bx - 8, 44, String(st.batteryPct) + " %", GxEPD_BLACK, Align::Right);
+  if (st.clock) text(g, UiSmall, 772, 44, clockText(time(nullptr), "%H:%M"), GxEPD_BLACK, Align::Right);
+  g.fillRect(24, 65, 752, 2, GxEPD_BLACK);
+}
+
+void drawFooter(Adafruit_GFX &g, const String &hint) {
+  text(g, UiSmall, 28, 466, hint, GxEPD_BLACK);
+}
+
+struct Row {
+  Row(const String &label, const String &value = "", bool submenu = false)
+      : label(label), value(value), submenu(submenu) {}
+  String label;
+  String value;
+  bool submenu;
+};
+
+void drawRow(Adafruit_GFX &g, int index, const Row &row, bool selected, bool last) {
+  const int16_t y = kRowTop + index * kRowH;
+  g.fillRect(0, y, 800, kRowH, GxEPD_WHITE);
+  const uint16_t fg = selected ? GxEPD_WHITE : GxEPD_BLACK;
+  if (selected) g.fillRoundRect(24, y + 3, 752, kRowH - 6, 8, GxEPD_BLACK);
+  text(g, selected ? UiBold : UiBody, 44, y + kRowH / 2 + 6, row.label, fg);
+  int16_t x = 748;
+  if (row.submenu) {
+    const int16_t cy = y + kRowH / 2;
+    for (int k = 0; k < 2; ++k) {
+      g.drawLine(x + 6 + k, cy - 7, x + 13 + k, cy, fg);
+      g.drawLine(x + 13 + k, cy, x + 6 + k, cy + 7, fg);
+    }
+    x -= 12;
+  }
+  if (row.value.length()) text(g, UiSmall, x, y + kRowH / 2 + 5, row.value, fg, Align::Right);
+  if (!selected && !last)
+    for (int16_t xx = 44; xx < 756; xx += 3) g.drawPixel(xx, y + kRowH, GxEPD_BLACK);
+}
+
+// --- Screen state ---
+
+GFXcanvas1 *g_screen = nullptr;  // what the panel shows while the UI owns it
+GFXcanvas1 *g_next = nullptr;    // the screen being built
+bool g_screenKnown = false;      // g_screen matches the panel
+bool g_fast = false;             // controller in register-LUT fast mode
+
+bool uiBuffers() {
+  if (!g_screen) g_screen = new GFXcanvas1(800, 480);
+  if (!g_next) g_next = new GFXcanvas1(800, 480);
+  return g_screen && g_next && g_screen->getBuffer() && g_next->getBuffer();
+}
+
+void stockMode() {
+  if (g_fast) leaveFastMode();
+  g_fast = false;
+}
+
+// Puts g_next on the panel: calm when the panel content is known, a clean
+// full refresh otherwise. Afterwards g_screen holds it.
+void present(bool full = false) {
+  stockMode();
+  if (!full && g_screenKnown) showCalm(g_screen->getBuffer(), g_next->getBuffer());
+  else showCanvas(g_next->getBuffer());
+  memcpy(g_screen->getBuffer(), g_next->getBuffer(), 48000);
+  g_screenKnown = true;
+}
+
+// Repaints rows [top, top + rows) of g_next on the fast waveform.
+void presentRows(int16_t top, int16_t rows) {
+  if (!g_fast) {
+    enterGameFast(g_screen->getBuffer());
+    g_fast = true;
+  }
+  display.epd2.writeVideoWindow(0x13, g_next->getBuffer() + size_t(top) * 100, top, rows);
+  display.epd2.refreshRows(top, rows, 1200);
+  memcpy(g_screen->getBuffer() + size_t(top) * 100, g_next->getBuffer() + size_t(top) * 100,
+         size_t(rows) * 100);
+}
+
+// Menu steps come from edge interrupts, not polling: a tap that starts and
+// ends during a ~0.2 s panel refresh still counts. Debounce by time: a press
+// counts only when the button was released for at least kNavDebounceMs, so
+// contact bounce on press or release never adds a step.
+constexpr uint32_t kNavDebounceMs = 30;
+struct NavButton {
+  int pin;
+  volatile bool down;
+  volatile uint32_t changedAt;
+  volatile uint16_t presses;
+};
+NavButton g_navButtons[2] = {{kLeftButton, false, 0, 0},
+                             {kRightButton, false, 0, 0}};
+
+void IRAM_ATTR navButtonIsr(void *arg) {
+  NavButton *button = static_cast<NavButton *>(arg);
+  const bool low = digitalRead(button->pin) == LOW;
+  const uint32_t now = millis();
+  if (low && !button->down) {
+    if (now - button->changedAt >= kNavDebounceMs) button->presses++;
+    button->down = true;
+    button->changedAt = now;
+  } else if (!low && button->down) {
+    button->down = false;
+    button->changedAt = now;
+  }
+}
+
+void armNavButtons() {
+  for (NavButton &button : g_navButtons) {
+    button.down = digitalRead(button.pin) == LOW;  // a held wake press is not a step
+    button.changedAt = millis();
+    button.presses = 0;
+    attachInterruptArg(digitalPinToInterrupt(button.pin), navButtonIsr, &button,
+                       CHANGE);
+  }
+}
+
+void disarmNavButtons() {
+  for (NavButton &button : g_navButtons)
+    detachInterrupt(digitalPinToInterrupt(button.pin));
+}
+
+uint16_t takeNavPresses(NavButton &button) {
+  noInterrupts();
+  const uint16_t presses = button.presses;
+  button.presses = 0;
+  interrupts();
+  return presses;
+}
+
+struct UiInput {
+  int steps;    // net selection change from the white buttons (+ = down)
+  int presses;  // white presses behind it, for the clicks
+  bool green;
+  bool hold;    // green held: back
+  bool timeout;
+};
+
+UiInput waitInput(uint32_t timeoutMs) {
+  const uint32_t deadline = millis() + timeoutMs;
+  while (int32_t(deadline - millis()) > 0) {
+    const int left = takeNavPresses(g_navButtons[0]);
+    const int right = takeNavPresses(g_navButtons[1]);
+    // Left white moves up, right white down.
+    if (left || right) return {right - left, left + right, false, false, false};
+    if (digitalRead(kGreenButton) == LOW) {
+      delay(30);  // debounce
+      if (digitalRead(kGreenButton) == LOW) {
+        const uint32_t pressedAt = millis();
+        while (digitalRead(kGreenButton) == LOW) {
+          if (millis() - pressedAt >= kLongPressMs) return {0, 0, true, true, false};
+          delay(10);
+        }
+        return {0, 0, true, false, false};
+      }
+    }
+    delay(5);
+  }
+  return {0, 0, false, false, true};
+}
+
+constexpr uint32_t kMenuIdleMs = 60 * 1000;
+constexpr uint32_t kViewIdleMs = 20 * 1000;
+
+enum class Pick { Chosen, Back, Timeout };
+
+// A list screen. Returns the chosen row in `selected`; `refresh(selected)`
+// may rewrite rows' values (e.g. toggles) and is called after each choice
+// that stays on the screen.
+Pick runList(const String &title, const String &crumb, std::vector<Row> &rows,
+             int &selected, const String &hint) {
+  drawHeader(*g_next, title, crumb);
+  for (int i = 0; i < int(rows.size()) && i < kMaxRows; ++i)
+    drawRow(*g_next, i, rows[i], i == selected, i == int(rows.size()) - 1);
+  drawFooter(*g_next, hint);
+  present();
+  setLed(false);
+  // Fast mode right away, while the screen is being read, so the first step
+  // is as quick as the rest.
+  enterGameFast(g_screen->getBuffer());
+  g_fast = true;
   waitForButtonsReleased();
+  armNavButtons();
+  for (;;) {
+    const UiInput input = waitInput(kMenuIdleMs);
+    if (input.presses) {
+      reterm::mark("press");
+      for (int i = 0; i < min(input.presses, 3); ++i) click();
+      const int previous = selected;
+      const int count = min<int>(rows.size(), kMaxRows);
+      selected = ((selected + input.steps) % count + count) % count;
+      if (selected == previous) continue;
+      drawRow(*g_next, previous, rows[previous], false, previous == count - 1);
+      drawRow(*g_next, selected, rows[selected], true, selected == count - 1);
+      const int16_t top = kRowTop + min(previous, selected) * kRowH;
+      presentRows(top, kRowTop + (max(previous, selected) + 1) * kRowH - top + 1);
+      reterm::mark("nav");
+      continue;
+    }
+    disarmNavButtons();
+    if (input.timeout) return Pick::Timeout;
+    click();
+    waitForButtonsReleased();
+    return input.hold ? Pick::Back : Pick::Chosen;
+  }
+}
+
+// Updates one row's value in place (fast waveform), e.g. a toggled setting.
+void updateRow(int index, const Row &row, bool selected, bool last) {
+  drawRow(*g_next, index, row, selected, last);
+  presentRows(kRowTop + index * kRowH, kRowH + 1);
+}
+
+// --- Views (pages) ---
+
+// Shows page `index`: calm from the page on the panel when known, a full
+// refresh otherwise or every few flips to clear ghosting.
+int g_flipsSinceFull = 0;
+
+bool showPage(int index, bool full = false) {
+  if (!uiBuffers() || !reterm::readPage(index, g_next->getBuffer())) return false;
+  const int shown = reterm::shownPage();
+  bool known = g_screenKnown;
+  if (!known && shown >= 0 && reterm::readPage(shown, g_screen->getBuffer())) known = true;
+  if (++g_flipsSinceFull >= 5) full = true;
+  stockMode();
+  if (!full && known) showCalm(g_screen->getBuffer(), g_next->getBuffer());
+  else showCanvas(g_next->getBuffer());
+  if (full || !known) g_flipsSinceFull = 0;
+  memcpy(g_screen->getBuffer(), g_next->getBuffer(), 48000);
+  g_screenKnown = true;
+  reterm::notePageShown(index);
+  reterm::mark("flip");
+  return true;
+}
+
+reterm::MenuAction runMenu();
+
+// Content mode: flip views with the white buttons while awake; green opens
+// the menu. Returns when idle (sleep) or when the menu asks for a session.
+reterm::MenuAction runViews(int firstStep) {
+  const int count = int(reterm::pageCount());
+  if (count < 2) return runMenu();
+  int current = reterm::shownPage() >= 0 ? reterm::shownPage() : 0;
+  if (firstStep) {
+    current = ((current + firstStep) % count + count) % count;
+    showPage(current);
+  }
+  setLed(false);
+  sfxBegin();
+  waitForButtonsReleased();
+  armNavButtons();
+  for (;;) {
+    const UiInput input = waitInput(kViewIdleMs);
+    if (input.presses) {
+      for (int i = 0; i < min(input.presses, 3); ++i) click();
+      current = ((current + input.steps) % count + count) % count;
+      showPage(current);
+      continue;
+    }
+    disarmNavButtons();
+    if (input.timeout) break;
+    click();
+    sfxEnd();
+    waitForButtonsReleased();
+    if (input.hold) return reterm::MenuAction::UploadSession;  // as at a wake
+    return runMenu();
+  }
+  sfxEnd();
+  stockMode();
+  return reterm::MenuAction::Sleep;
+}
+
+// Leaves the UI showing the current view (or the saved photo) cleanly.
+void showContent() {
+  stockMode();
+  const int shown = reterm::shownPage();
+  if (reterm::pageCount() && showPage(shown >= 0 ? shown : 0, true)) return;
+  if (!restoreSavedPhoto()) Serial.println("No saved image available to restore");
+}
+
+// --- Screens ---
+
+String batteryText(const reterm::Status &st) {
+  char volts[8];
+  snprintf(volts, sizeof(volts), "%d,%02d V", st.batteryMv / 1000, (st.batteryMv % 1000) / 10);
+  return String(st.batteryPct) + " %  ·  " + volts;
+}
+
+void runStatus() {
+  const reterm::Status st = reterm::status();
+  drawHeader(*g_next, "Status", "Menü ›");
+  struct Line {
+    const char *label;
+    String value;
+  };
+  const String fresh = !st.serverImage ? "eigenes Bild" : (st.stale ? "veraltet" : "aktuell");
+  const Line lines[] = {
+      {"Akku", batteryText(st)},
+      {"WLAN", st.ssid.length() ? st.ssid + "  ·  " + String(st.rssi) + " dBm  ·  " + st.ip
+                                : String("noch keine Verbindung")},
+      {"Zuletzt verbunden", whenText(st.lastCheckin)},
+      {"Bild", st.issued ? "Stand " + whenText(st.issued) + "  ·  " + fresh : fresh},
+      {"Nächstes Aufwachen",
+       st.nextWake ? whenText(st.nextWake) : String(st.brokerConfigured ? "unbekannt" : "aus")},
+      {"Firmware", st.firmware},
+      {"Uhr", st.clock ? "gestellt" : "unbekannt"},
+  };
+  for (int i = 0; i < 7; ++i) {
+    const int16_t y = 104 + i * 46;
+    text(*g_next, UiSmall, 44, y, lines[i].label, GxEPD_BLACK);
+    text(*g_next, UiBody, 250, y, lines[i].value, GxEPD_BLACK);
+    for (int16_t x = 44; x < 756; x += 3) g_next->drawPixel(x, y + 16, GxEPD_BLACK);
+  }
+  drawFooter(*g_next, "Grün: zurück");
+  present();
+  waitForButtonsReleased();
+  const uint32_t deadline = millis() + kMenuIdleMs;
+  while (digitalRead(kGreenButton) == HIGH && int32_t(deadline - millis()) > 0) delay(10);
+  click();
+  waitForButtonsReleased();
+}
+
+// Settings; returns true when the frame should restart.
+bool runSettings() {
   int selected = 0;
   for (;;) {
-    drawMenuScreen(selected);
-    const ButtonPress press = waitForPress(kGameIdleMs);
-    waitForButtonsReleased();
-    if (press.button == kBtnLeft) {
-      selected = (selected + 1) % 5;
+    std::vector<Row> rows = {
+        {"Töne", g_ui.sound ? "An" : "Aus"},
+        {"Status-LED", g_ui.led ? "An" : "Aus"},
+        {"Bildschirm auffrischen", ""},
+        {"Neu starten", ""},
+        {"WLAN vergessen", "Grün 3 s halten"},
+    };
+    const Pick pick = runList("Einstellungen", "Menü ›", rows, selected,
+                              "Grün: wählen  ·  Grün halten: zurück");
+    if (pick != Pick::Chosen) return false;
+    if (selected == 0) g_ui.sound = !g_ui.sound;
+    if (selected == 1) g_ui.led = !g_ui.led;
+    if (selected <= 1) {
+      saveUiPrefs();
       continue;
     }
-    if (press.button == kBtnRight) {
-      selected = (selected + 4) % 5;
+    if (selected == 2) {
+      // A full refresh of this screen clears ghosting; the content gets one
+      // on leaving the menu anyway.
+      present(true);
       continue;
     }
-    if (press.button == kBtnGreen) {
-      if (selected == 0) {
-        // A green hold in the game returns here; RPS otherwise leaves its
-        // result screen up and a wall-mode pet reclaims the panel on the
-        // next timer wake.
-        if (playRockPaperScissors()) continue;
-        return reterm::MenuAction::Sleep;
+    if (selected == 3) return true;
+    if (selected == 4) {
+      // Deliberate only: green held three more seconds.
+      stockMode();
+      drawMessageScreen("WLAN VERGESSEN?", "Gruen jetzt 3 Sekunden halten");
+      g_screenKnown = false;
+      const uint32_t start = millis();
+      while (millis() - start < 4000 && digitalRead(kGreenButton) == HIGH) delay(10);
+      const uint32_t held = millis();
+      while (digitalRead(kGreenButton) == LOW && millis() - held < 3000) delay(10);
+      if (digitalRead(kGreenButton) == LOW) {
+        Preferences preferences;
+        if (preferences.begin("wificaptive", false)) {
+          preferences.clear();
+          preferences.end();
+        }
+        drawMessageScreen("WLAN VERGESSEN", "Beim naechsten Start: Einrichtung");
+        delay(2000);
+        return true;
       }
-      if (selected == 1) {
-        if (runPetScreen()) continue;      // green: back to the menu
-        return reterm::MenuAction::Sleep;  // idle: pet stays on the wall
-      }
-      if (selected == 2) {
-        Serial.println("Menu: upload session requested");
-        return reterm::MenuAction::UploadSession;
-      }
-      if (selected == 4) {
-        if (playLastVideo()) return reterm::MenuAction::Sleep;
-        drawMessageScreen("NO VIDEO QUEUED",
-                          "Send a video command over MQTT first");
+    }
+  }
+}
+
+// Games; returns false when a game left its screen up for sleep.
+bool runGames() {
+  int selected = 0;
+  for (;;) {
+    std::vector<Row> rows = {{"Schere, Stein, Papier", ""}, {"Luna, das Einhorn", ""},
+                             {"Bad Apple", ""}};
+    const Pick pick = runList("Spiele", "Menü ›", rows, selected,
+                              "Grün: starten  ·  Grün halten: zurück");
+    if (pick != Pick::Chosen) return true;
+    stockMode();
+    sfxEnd();  // the games run their own audio
+    g_screenKnown = false;
+    bool back = true;
+    if (selected == 0) back = playRockPaperScissors();
+    if (selected == 1) back = runPetScreen();
+    if (selected == 2) {
+      if (!playLastVideo()) {
+        drawMessageScreen("KEIN VIDEO", "Erst ein video-Kommando per MQTT senden");
         delay(3000);
-        continue;
+      } else {
+        back = false;
       }
-      PetState pet = loadPet();
-      if (pet.onWall) {
-        pet.onWall = false;
-        savePet(pet);
-      }
-      if (!restoreSavedPhoto())
-        Serial.println("No saved image available to restore");
+    }
+    g_screenKnown = false;
+    sfxBegin();
+    if (!back) return false;
+  }
+}
+
+// Returns true when a view was shown (leave the menu).
+bool runViewPicker() {
+  const int count = int(reterm::pageCount());
+  int selected = max(0, reterm::shownPage());
+  std::vector<Row> rows;
+  for (int i = 0; i < count && i < kMaxRows; ++i) rows.push_back({reterm::pageTitle(i), ""});
+  if (rows.empty()) rows.push_back({"Keine Ansichten", "vom Server"});
+  const Pick pick = runList("Ansicht", "Menü ›", rows, selected,
+                            "Grün: zeigen  ·  Grün halten: zurück");
+  if (pick != Pick::Chosen || !count) return false;
+  return showPage(selected, true);
+}
+
+reterm::MenuAction runMenu() {
+  Serial.println("Menu");
+  reterm::notePanelShowsSavedImage(false);  // the UI owns the panel
+  if (!uiBuffers()) return reterm::MenuAction::Sleep;
+  g_screenKnown = false;  // whatever is up, the first screen gets a full refresh
+  sfxBegin();
+  struct SfxGuard {
+    ~SfxGuard() { sfxEnd(); }
+  } sfxGuard;
+  int selected = 0;
+  for (;;) {
+    const reterm::Status st = reterm::status();
+    const int shown = reterm::shownPage();
+    std::vector<Row> rows = {
+        {"Jetzt aktualisieren", st.lastCheckin ? "zuletzt " + whenText(st.lastCheckin) : ""},
+        {"Ansicht", shown >= 0 ? reterm::pageTitle(shown) : String(""), true},
+        {"Foto senden", "", true},
+        {"Status", "Akku " + String(st.batteryPct) + " %", true},
+        {"Einstellungen", "", true},
+        {"Spiele", "", true},
+    };
+    const Pick pick = runList("Menü", "", rows, selected,
+                              "Grün: öffnen  ·  Grün halten: zurück zur Ansicht");
+    if (pick != Pick::Chosen) {
+      showContent();
       return reterm::MenuAction::Sleep;
     }
-    // Menu idle: never leave the menu as wallpaper.
-    const PetState pet = loadPet();
-    if (pet.adopted && pet.onWall) drawPetScreen(pet);
-    else if (!restoreSavedPhoto())
-      Serial.println("No saved image available to restore");
-    return reterm::MenuAction::Sleep;
+    switch (selected) {
+      case 0: {
+        rows[0].value = "läuft …";
+        updateRow(0, rows[0], true, false);
+        stockMode();  // a new image would refresh with the stock waveforms
+        bool changed = false;
+        const bool ok = reterm::checkInNow(changed);
+        if (changed) return reterm::MenuAction::Sleep;  // the new image is up
+        rows[0].value = ok ? "aktuell  ·  " + whenText(reterm::status().lastCheckin)
+                           : String("keine Verbindung");
+        updateRow(0, rows[0], true, false);
+        delay(1500);
+        break;
+      }
+      case 1:
+        if (runViewPicker()) return runViews(0);
+        break;
+      case 2:
+        stockMode();
+        return reterm::MenuAction::UploadSession;
+      case 3:
+        runStatus();
+        break;
+      case 4:
+        if (runSettings()) {
+          stockMode();
+          ESP.restart();
+        }
+        break;
+      case 5:
+        if (!runGames()) return reterm::MenuAction::Sleep;
+        break;
+    }
   }
 }
 
@@ -1922,7 +2495,10 @@ class E1001Board final : public reterm::Board {
   void drawProvisionScreen(const String &ssid, const String &password) override {
     drawProvisionQr(ssid, password);
   }
-  void drawUploadScreen(const String &url) override { drawUploadQr(url); }
+  void drawUploadScreen(const String &url) override {
+    drawUploadQr(url);
+    setLed(false);
+  }
   bool wokeByButton() const override {
     if (g_suppressButtonWake) return false;
     if (g_wantSessionFromMenu) return true;
@@ -1932,6 +2508,54 @@ class E1001Board final : public reterm::Board {
     }
     return false;
   }
+  // The staleness badge, patched into the saved photo as a partial refresh.
+  // After deep sleep the controller's RAM holds garbage, and this panel's
+  // partial update drives the whole screen from the old/new plane
+  // difference, so both planes are seeded with the full saved image (old =
+  // what the panel shows, new = what it should show): only the badge pixels
+  // differ, so only they change.
+  bool drawBadge(int16_t x, int16_t y, int16_t w, int16_t h, const char *text,
+                 bool show) override {
+    if (h <= 0 || w <= 0 || y < 0 || y + h > 480 || x < 0 || x + w > 800)
+      return false;
+    if (!SPIFFS.begin(true)) return false;
+    const char *path = SPIFFS.exists("/current-image.bin")
+                           ? "/current-image.bin"
+                           : "/previous-image.bin";
+    File file = SPIFFS.open(path, FILE_READ);
+    if (!file || file.size() != size_t(48000)) {
+      if (file) file.close();
+      return false;
+    }
+    GFXcanvas1 clean(800, 480), badged(800, 480);
+    if (!clean.getBuffer() || !badged.getBuffer() ||
+        file.read(clean.getBuffer(), 48000) != 48000) {
+      file.close();
+      return false;
+    }
+    file.close();
+    memcpy(badged.getBuffer(), clean.getBuffer(), 48000);
+    badged.fillRect(x, y, w, h, GxEPD_BLACK);
+    badged.drawRect(x + 2, y + 2, w - 4, h - 4, GxEPD_WHITE);
+    badged.setTextColor(GxEPD_WHITE);
+    const uint8_t size = h >= 24 ? 2 : 1;
+    badged.setTextSize(size);
+    const int16_t textW = int16_t(strlen(text)) * 6 * size - size;
+    badged.setCursor(x + max<int16_t>(4, (w - textW) / 2), y + (h - 7 * size) / 2);
+    badged.print(text);
+
+    const uint8_t *before = show ? clean.getBuffer() : badged.getBuffer();
+    const uint8_t *after = show ? badged.getBuffer() : clean.getBuffer();
+    display.epd2.selectSPI(epaperSpi, SPISettings(kPanelSpiHz, MSBFIRST, SPI_MODE0));
+    display.init(115200, false);  // not initial: allow a partial refresh
+    display.setRotation(0);
+    display.epd2.writeImageToPrevious(before, 0, 0, 800, 480, false, false, false);
+    display.epd2.writeImage(after, 0, 0, 800, 480, false, false, false);
+    display.epd2.refresh(x, y, w, h);
+    display.hibernate();
+    return true;
+  }
+
   // setup() measures the green hold once at wake; answer from that.
   bool wakeHoldRequestsWifiReset() override { return g_wifiResetHold; }
   // Holding green for about a second while the device is awake (upload
@@ -1949,7 +2573,7 @@ class E1001Board final : public reterm::Board {
     }
     return false;
   }
-  reterm::MenuAction onMenu() override { return runArcade(); }
+  reterm::MenuAction onMenu() override { return runMenu(); }
   bool handleCommand(const String &action, const String &payload,
                      String &detail, void (*serviceNetwork)()) override {
     if (action != "video") return false;
@@ -1974,6 +2598,8 @@ class E1001Board final : public reterm::Board {
     return true;
   }
   void prepareSleep() override {
+    setLed(false);
+    pinMode(kLedPin, INPUT);
     pinMode(kGreenButton, INPUT_PULLUP);
     esp_sleep_enable_ext0_wakeup(kGreenButton, 0);
     // Either white button wakes into the arcade. Hold the RTC pullups so the
@@ -1993,12 +2619,27 @@ E1001Board board;
 }  // namespace
 
 void setup() {
+  // Feedback before anything slow: a button wake lights the LED and clicks
+  // right away, while the panel still takes its second.
+  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  const bool buttonWake = wakeCause == ESP_SLEEP_WAKEUP_EXT0 ||
+                          wakeCause == ESP_SLEEP_WAKEUP_EXT1;
+  loadUiPrefs();
+  if (buttonWake) {
+    setLed(true);
+    if (g_ui.sound && sfxBegin()) {
+      sfxPress();
+      sfxEnd();
+    }
+  }
+  reterm::mark("setup");
   Serial.begin(reterm::kImageBaud);
-  delay(200);
+  // Only the workbench tools after power-on need the host to catch up.
+  if (wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED) delay(200);
   Serial.println("reterm E1001 custom photo card: boot");
 
   epaperSpi.begin(kSck, -1, kMosi, -1);
-  display.epd2.selectSPI(epaperSpi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  display.epd2.selectSPI(epaperSpi, SPISettings(kPanelSpiHz, MSBFIRST, SPI_MODE0));
   display.init(115200);
   display.setRotation(0);
 
@@ -2008,28 +2649,31 @@ void setup() {
   // arcade, and the green wake is classified by hold length. All paths fall
   // through into run(), which sees the flags via wokeByButton() /
   // wakeHoldRequestsWifiReset() and otherwise takes its normal course.
-  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
   if (wakeCause == ESP_SLEEP_WAKEUP_TIMER) petTimerTick();
+  // The runtime first: views, status, and check-ins are used from here on.
+  reterm::begin(board);
   if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
-    if (runArcade() == reterm::MenuAction::UploadSession)
-      g_wantSessionFromMenu = true;
+    // A white button flips the view: left back, right forward.
+    const uint64_t woke = esp_sleep_get_ext1_wakeup_status();
+    const int step = (woke & (1ULL << kLeftButton)) ? -1 : 1;
+    if (runViews(step) == reterm::MenuAction::UploadSession) g_wantSessionFromMenu = true;
   }
   if (wakeCause == ESP_SLEEP_WAKEUP_EXT0) {
-    // Classify the green press: a tap keeps today's photo session, about a
-    // second of holding opens the arcade, five seconds still forgets the
-    // saved Wi-Fi network.
+    // Classify the green press: a tap opens the menu, about a second of
+    // holding goes straight to the photo upload session, five seconds
+    // forgets the saved Wi-Fi.
     const uint32_t pressedAt = millis();
     while (digitalRead(kGreenButton) == LOW && millis() - pressedAt < 5000)
       delay(20);
     const uint32_t held = millis() - pressedAt;
     if (held >= 5000) {
       g_wifiResetHold = true;
-    } else if (held >= kLongPressMs) {
-      if (runArcade() == reterm::MenuAction::UploadSession)
+    } else if (held < kLongPressMs) {
+      if (runMenu() == reterm::MenuAction::UploadSession)
         g_wantSessionFromMenu = true;
       else
         g_suppressButtonWake = true;
-    }
+    }  // a hold falls through: run() sees a button wake and starts the session
   }
   reterm::run(board);
 }

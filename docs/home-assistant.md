@@ -48,6 +48,60 @@ the integration. Settings live in the `reterm-ha` NVS namespace, next to the
   `config.h` but is unverified on hardware (one upstream table marks the pin
   absent); sanity-check its first reported voltages.
 
+- A power-on or reset boot (including the reboot after a firmware update)
+  checks in right away instead of waiting a full interval.
+- Wakes from deep sleep skip the three-second UART command window; only a
+  power-on or reset keeps it for the workbench tools.
+- Wi-Fi reconnects skip the scan: the last association's channel and BSSID
+  survive deep sleep in RTC memory. If that access point does not answer
+  within 4 s the device forgets it and scans as after a power-on.
+- Latency marks (milliseconds since boot) are kept in RTC memory across
+  wakes without a check-in (view flips, menus) and published at the next
+  check-in as `{"event":"timing","marks":[["button",0,12],["flip",412,12],…]}`
+  — name, milliseconds, boot number; each boot starts with a mark named
+  after its wake reason.
+- Check-ins no longer wait a fixed three seconds for retained messages: the
+  device publishes to its own `reterm/<id>/sync` after subscribing and
+  continues once that message arrives behind the retained ones.
+- Every check-in syncs the clock over SNTP from the DHCP gateway (3 s at
+  most). The RTC keeps the time across deep sleep, so a missed sync only adds
+  drift (the internal RC oscillator can drift a few percent, i.e. minutes
+  over a long night).
+
+## Wake schedule and out-of-date badge
+
+A server may publish a retained plan on `reterm/<id>/schedule`. The device
+reads it on every check-in, persists it, and never clears it:
+
+```json
+{"wake": [1792209720, 1792211520],
+ "valid_until": 1792210320,
+ "sha256": "<sha256 of the image the server means to show>",
+ "badge": [8, 452, 198, 24],
+ "tz": "CET-1CEST,M3.5.0,M10.5.0/3"}
+```
+
+- `wake`: epochs (ascending, at most 96). The device sleeps until the first
+  one at least 20 s ahead and at most 24 h away. When the list runs out, or
+  the clock is unknown, it falls back to the wake interval; interval `0`
+  still disables timer wakes. Quiet hours are simply gaps in the list.
+- `valid_until` and `sha256`: an image delivered by an MQTT `image` command
+  counts as out of date once `valid_until` passed, or when the plan names a
+  different image than the panel shows (e.g. the fetch failed). Manually
+  uploaded images never do. Publishing a fresh plan on every server run
+  keeps the image current; a dead server or a broken network lets it expire.
+- `badge`: where the board draws the out-of-date badge ("STAND FR 20:30",
+  the image's `issued` time in `tz`), as a windowed partial refresh over the
+  saved image. It is removed the same way once the image is current again,
+  and never drawn over menus, games, or wall modes. The E1004 does not draw
+  badges yet. Without a `badge` box the state still reports `stale`.
+- `tz`: POSIX TZ string for badge times (default Europe/Berlin).
+
+The state topic adds `next_wake` (epoch), `next_wake_iso`, `clock`, `stale`,
+and `badge`; discovery adds a "Next wake" timestamp sensor and an "Image
+out of date" problem binary sensor, and stretches `expire_after` over the
+longest planned gap so quiet hours do not mark the device unavailable.
+
 ## MQTT surface
 
 Device id is `<hostname>-<mac6>`, e.g. `reterm-e1001-a1b2c3` (same suffix as
@@ -59,9 +113,10 @@ the provisioning AP name).
 | `reterm/<id>/state` | device → HA | yes | the `/api/status` JSON (geometry + fw, battery_mv, battery_pct, rssi, wake, wake_interval_min) |
 | `reterm/<id>/cmd` | HA → device | yes | command JSON, cleared by the device after processing |
 | `reterm/<id>/set/wake-interval` | HA → device | yes | minutes, written by the HA number entity (`retain: true`), cleared after apply |
+| `reterm/<id>/schedule` | server → device | yes | the wake plan above; read every check-in, never cleared |
 | `reterm/<id>/event` | device → HA | no | acks: `{"event":"image","ok":…,"id":…}`, `{"event":"session","url":…}`, errors |
 
-Sensors carry `expire_after` (2× interval + 5 min) so the device shows
+Sensors carry `expire_after` (longest planned gap + interval + 5 min) so the device shows
 unavailable after two missed check-ins. Discovery is republished on every
 check-in, so a wiped broker heals itself.
 
@@ -89,6 +144,30 @@ timestamp so identical images can be re-sent deliberately.
   in the following state. The password sits retained on the broker until the
   next wake consumes it.
 
+- `{"action":"ota","id":"…","url":"http://…","sha256":"…","version":"…"}`
+  — streams a firmware image into the inactive OTA slot, checks the
+  mandatory sha256 before the slot becomes bootable, acks with
+  `{"event":"ota","ok":…,"detail":…}`, and reboots. The command id is
+  stored and the retained command cleared before installing, so it can
+  never re-flash. An optional `version` equal to the running
+  `RETERM_FW_VERSION` is acked without reinstalling. The new firmware boots
+  in "pending verify" and confirms itself only after its first successful
+  check-in (event `"detail":"confirmed <version>"`); if it crashes or cannot
+  check in during that first boot, the bootloader returns to the previous
+  firmware. Without a configured broker a boot confirms immediately.
+- `image` commands may carry `"issued": <epoch>`, the content time the
+  out-of-date badge shows.
+- `{"action":"pages","id":"…","issued":…,"pages":[{"name":"woche","title":"Diese Woche","url":"http://…","sha256":"…"},…]}`
+  — up to eight named views (names `a-z0-9-`, at most 12 characters, sha256
+  mandatory). The device fetches only pages whose sha256 changed, deletes
+  pages no longer listed, and shows the first (the home view) when it is new
+  — unless someone flipped to another view in the last 15 minutes. The home
+  view also becomes the saved image, so the schedule's `sha256` and the
+  badge refer to it. Ack: `{"event":"pages","ok":…,"detail":"fetched 1 of 3, home shown"}`.
+  The last manually uploaded photo is kept as a local "Foto" page. A timer
+  wake brings the home view back once another view has been up for 15
+  minutes.
+
 ## Sending an image from the HA side
 
 ```sh
@@ -113,6 +192,7 @@ reports exactly the deploy it runs.
 
 The device speaks plain MQTT 3.1.1 (no TLS) with username/password. It needs
 publish access to `reterm/<id>/…` and `homeassistant/device/<id>/config`, and
-subscribe access to `reterm/<id>/cmd` and `reterm/<id>/set/wake-interval`. HA
+subscribe access to `reterm/<id>/cmd`, `reterm/<id>/set/wake-interval`, and
+`reterm/<id>/schedule`. HA
 must have the MQTT integration with discovery enabled (default prefix
 `homeassistant`).
