@@ -111,7 +111,8 @@ the provisioning AP name).
 |---|---|---|---|
 | `homeassistant/device/<id>/config` | device → HA | yes | device-based discovery: battery %, voltage, RSSI, wake reason, wake-interval number |
 | `reterm/<id>/state` | device → HA | yes | the `/api/status` JSON (geometry + fw, battery_mv, battery_pct, rssi, wake, wake_interval_min) |
-| `reterm/<id>/cmd` | HA → device | yes | command JSON, cleared by the device after processing |
+| `reterm/<id>/cmd` | HA → device | yes | command JSON; with an `id` it stays retained (the stored id drops redeliveries), without one, or carrying a Wi-Fi password, it is cleared after processing |
+| `reterm/<id>/ota` | server → device | yes | firmware rollout `{id, url, sha256, version}`, independent of `cmd` |
 | `reterm/<id>/set/wake-interval` | HA → device | yes | minutes, written by the HA number entity (`retain: true`), cleared after apply |
 | `reterm/<id>/schedule` | server → device | yes | the wake plan above; read every check-in, never cleared |
 | `reterm/<id>/event` | device → HA | no | acks: `{"event":"image","ok":…,"id":…}`, `{"event":"session","url":…}`, errors |
@@ -123,7 +124,11 @@ check-in, so a wiped broker heals itself.
 ## Commands
 
 Commands carry an optional `id`; the device persists the last processed id
-and silently drops retained duplicates. `tools/ha-publish-image.py` appends a
+and silently drops retained duplicates. Commands with an id are left
+retained rather than cleared: a blind clear after a long command (a pages
+fetch) would wipe whatever a server published meanwhile. Commands without
+an id are cleared, and so is the `wifi` command, so its password does not
+stay on the broker. `tools/ha-publish-image.py` appends a
 timestamp so identical images can be re-sent deliberately.
 
 - `{"action":"image","id":"…","url":"http://…","sha256":"…"}` — the device
@@ -148,13 +153,19 @@ timestamp so identical images can be re-sent deliberately.
   — streams a firmware image into the inactive OTA slot, checks the
   mandatory sha256 before the slot becomes bootable, acks with
   `{"event":"ota","ok":…,"detail":…}`, and reboots. The command id is
-  stored and the retained command cleared before installing, so it can
-  never re-flash. An optional `version` equal to the running
+  stored before installing, so a redelivery can never re-flash. An optional `version` equal to the running
   `RETERM_FW_VERSION` is acked without reinstalling. The new firmware boots
   in "pending verify" and confirms itself only after its first successful
   check-in (event `"detail":"confirmed <version>"`); if it crashes or cannot
   check in during that first boot, the bootloader returns to the previous
   firmware. Without a configured broker a boot confirms immediately.
+- The same rollout can come on its own retained topic,
+  `reterm/<id>/ota` (`{"id","url","sha256","version"}`), so a content
+  server publishing to `cmd` and a firmware rollout never replace each
+  other. The device checks it at every check-in, before commands; a
+  `version` already running is ignored without an event, and each `id`
+  gets exactly one attempt (stored in NVS), so a bad image cannot loop.
+  Clear the retained message once the new version is confirmed.
 - `image` commands may carry `"issued": <epoch>`, the content time the
   out-of-date badge shows.
 - `{"action":"pages","id":"…","issued":…,"pages":[{"name":"woche","title":"Diese Woche","url":"http://…","sha256":"…"},…]}`

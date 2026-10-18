@@ -1338,6 +1338,9 @@ String mqttEventTopic;
 String mqttScheduleTopic;
 String mqttSyncTopic;
 bool pendingSyncSeen = false;
+String mqttOtaTopic;
+String pendingOtaPayload;
+bool pendingOtaSeen = false;
 String pendingCmdPayload;
 String pendingWakePayload;
 String pendingSchedulePayload;
@@ -1369,6 +1372,9 @@ void onMqttMessage(char *topic, uint8_t *payload, unsigned int length) {
     pendingScheduleSeen = true;
   } else if (mqttSyncTopic == topic) {
     pendingSyncSeen = true;
+  } else if (mqttOtaTopic == topic) {
+    pendingOtaPayload = value;
+    pendingOtaSeen = true;
   }
 }
 
@@ -1863,7 +1869,66 @@ bool confirmFirmware() {
   return true;
 }
 
+// Installs firmware from an `ota` command or the ota topic, acks it, and
+// reboots on success. A `version` already running is acked, not reinstalled.
+void installFirmware(const String &url, const String &sha256, const String &version,
+                     const String &id) {
+  String detail;
+  bool ok;
+  const bool running = version.length() && version == RETERM_FW_VERSION;
+  if (running) {
+    ok = true;
+    detail = "already running " + version;
+  } else {
+    ok = fetchAndInstallFirmware(url, sha256, detail);
+  }
+  detail.replace("\"", "'");
+  publishEvent(String("{\"event\":\"ota\",\"ok\":") + (ok ? "true" : "false") +
+               ",\"detail\":\"" + detail + "\",\"id\":\"" + id + "\"}");
+  Serial.print("OTA: ");
+  Serial.println(detail);
+  if (!ok || running) return;
+  const uint32_t drain = millis() + 500;
+  while (int32_t(drain - millis()) > 0) {
+    mqtt.loop();
+    delay(10);
+  }
+  mqtt.disconnect();
+  if (!g_panelHibernated) g_board->hibernate();
+  Serial.flush();
+  ESP.restart();
+}
+
+// The retained ota topic: {"id","url","sha256","version"}, independent of
+// the command topic so a content server and a firmware rollout never
+// overwrite each other. Each id gets one attempt; a version already
+// running is ignored without an event.
+void processOta(const String &payload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return;
+  const String id = doc["id"] | "";
+  const String version = doc["version"] | "";
+  if (id.isEmpty() || (version.length() && version == RETERM_FW_VERSION)) return;
+  Preferences preferences;
+  if (!preferences.begin(kHaPrefsNamespace, false)) return;
+  const bool tried = preferences.getString("last_ota", "") == id;
+  if (!tried) preferences.putString("last_ota", id);
+  preferences.end();
+  if (tried) return;
+  installFirmware(doc["url"] | "", doc["sha256"] | "", version, id);
+}
+
 enum class CommandOutcome { None, Handled, SessionRequested };
+
+// Marks a command done. Commands with an id stay retained: the stored id
+// drops the redelivery, and nothing published while this check-in ran can
+// be wiped by a blind clear (a pages command overwrote and then a clear
+// erased an OTA command that way). Commands without an id, and sensitive
+// ones (a Wi-Fi password), are cleared.
+void consumeCommand(const String &commandId, bool sensitive = false) {
+  if (commandId.length()) storeLastCommandId(commandId);
+  if (commandId.isEmpty() || sensitive) clearRetained(mqttCmdTopic);
+}
 
 CommandOutcome processCommand(const String &payload, bool allowSession) {
   JsonDocument doc;
@@ -1876,8 +1941,7 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
   const String action = doc["action"] | "";
   const String commandId = doc["id"] | "";
   if (commandId.length() && commandId == loadLastCommandId()) {
-    // Retained duplicate of a command that already ran; drop it silently.
-    clearRetained(mqttCmdTopic);
+    // Retained duplicate of a command that already ran; leave it be.
     return CommandOutcome::None;
   }
 
@@ -1886,8 +1950,7 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
     const String sha = doc["sha256"] | "";
     const bool ok =
         url.length() && fetchAndDisplayImage(url, sha, doc["issued"] | 0u);
-    if (commandId.length()) storeLastCommandId(commandId);
-    clearRetained(mqttCmdTopic);
+    consumeCommand(commandId);
     publishEvent(String("{\"event\":\"image\",\"ok\":") +
                  (ok ? "true" : "false") + ",\"id\":\"" + commandId + "\"}");
     return CommandOutcome::Handled;
@@ -1911,8 +1974,7 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
         preferences.end();
       }
     }
-    if (commandId.length()) storeLastCommandId(commandId);
-    clearRetained(mqttCmdTopic);
+    consumeCommand(commandId, true);  // never leave the password retained
     publishEvent(String("{\"event\":\"wifi\",\"ok\":") + (ok ? "true" : "false") +
                  ",\"ssid\":\"" + ssid + "\",\"id\":\"" + commandId + "\"}");
     Serial.println(ok ? "Wi-Fi credentials updated over MQTT; applied on next connection"
@@ -1922,42 +1984,15 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
   if (action == "pages") {
     String detail;
     const bool ok = applyPages(doc["pages"].as<JsonArray>(), doc["issued"] | 0u, detail);
-    if (commandId.length()) storeLastCommandId(commandId);
-    clearRetained(mqttCmdTopic);
+    consumeCommand(commandId);
     detail.replace("\"", "'");
     publishEvent(String("{\"event\":\"pages\",\"ok\":") + (ok ? "true" : "false") +
                  ",\"detail\":\"" + detail + "\",\"id\":\"" + commandId + "\"}");
     return CommandOutcome::Handled;
   }
   if (action == "ota") {
-    // Record and clear first: a retained duplicate must never re-flash.
-    if (commandId.length()) storeLastCommandId(commandId);
-    clearRetained(mqttCmdTopic);
-    const String version = doc["version"] | "";
-    String detail;
-    bool ok;
-    if (version.length() && version == RETERM_FW_VERSION) {
-      ok = true;
-      detail = "already running " + version;
-    } else {
-      ok = fetchAndInstallFirmware(doc["url"] | "", doc["sha256"] | "", detail);
-    }
-    detail.replace("\"", "'");
-    publishEvent(String("{\"event\":\"ota\",\"ok\":") + (ok ? "true" : "false") +
-                 ",\"detail\":\"" + detail + "\",\"id\":\"" + commandId + "\"}");
-    Serial.print("OTA: ");
-    Serial.println(detail);
-    if (ok && !(version.length() && version == RETERM_FW_VERSION)) {
-      const uint32_t drain = millis() + 500;
-      while (int32_t(drain - millis()) > 0) {
-        mqtt.loop();
-        delay(10);
-      }
-      mqtt.disconnect();
-      if (!g_panelHibernated) g_board->hibernate();
-      Serial.flush();
-      ESP.restart();
-    }
+    consumeCommand(commandId);  // record first: a duplicate must never re-flash
+    installFirmware(doc["url"] | "", doc["sha256"] | "", doc["version"] | "", commandId);
     return CommandOutcome::Handled;
   }
   if (action == "session") {
@@ -1966,8 +2001,7 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
       // command untouched so the next timer wake starts the requested session.
       return CommandOutcome::None;
     }
-    if (commandId.length()) storeLastCommandId(commandId);
-    clearRetained(mqttCmdTopic);
+    consumeCommand(commandId);
     // Publish the tokenized URL before the session begins: the QR screen and
     // upload loop monopolize the device once the session starts. Anyone who
     // can read this topic can upload for the next five minutes.
@@ -1985,8 +2019,7 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
   String detail;
   if (g_board->handleCommand(action, payload, detail,
                              [] { mqtt.loop(); })) {
-    if (commandId.length()) storeLastCommandId(commandId);
-    clearRetained(mqttCmdTopic);
+    consumeCommand(commandId);
     detail.replace("\"", "'");
     detail.replace("\\", "/");
     publishEvent("{\"event\":\"" + action + "\",\"detail\":\"" + detail +
@@ -1996,8 +2029,7 @@ CommandOutcome processCommand(const String &payload, bool allowSession) {
 
   Serial.print("Ignoring unsupported MQTT command action: ");
   Serial.println(action);
-  if (commandId.length()) storeLastCommandId(commandId);
-  clearRetained(mqttCmdTopic);
+  consumeCommand(commandId);
   publishEvent("{\"event\":\"error\",\"detail\":\"unsupported action\"}");
   return CommandOutcome::Handled;
 }
@@ -2019,6 +2051,8 @@ bool runHaCheckin(bool allowSession) {
   mqttEventTopic = "reterm/" + id + "/event";
   mqttScheduleTopic = "reterm/" + id + "/schedule";
   mqttSyncTopic = "reterm/" + id + "/sync";
+  mqttOtaTopic = "reterm/" + id + "/ota";
+  pendingOtaSeen = false;
   pendingCmdSeen = pendingWakeSeen = pendingScheduleSeen = pendingSyncSeen = false;
   syncClock();
 
@@ -2043,6 +2077,7 @@ bool runHaCheckin(bool allowSession) {
   mqtt.subscribe(mqttCmdTopic.c_str());
   mqtt.subscribe(mqttSetWakeTopic.c_str());
   mqtt.subscribe(mqttScheduleTopic.c_str());
+  mqtt.subscribe(mqttOtaTopic.c_str());
   mqtt.subscribe(mqttSyncTopic.c_str());
   // The broker sends each subscription's retained message right after its
   // SUBACK, in order, so a message published to our own sync topic after
@@ -2095,6 +2130,9 @@ bool runHaCheckin(bool allowSession) {
   }
   if (confirmFirmware())
     publishEvent("{\"event\":\"ota\",\"ok\":true,\"detail\":\"confirmed " RETERM_FW_VERSION "\"}");
+
+  // A firmware rollout first; it reboots and the command waits retained.
+  if (pendingOtaSeen && pendingOtaPayload.length()) processOta(pendingOtaPayload);
 
   CommandOutcome outcome = CommandOutcome::None;
   if (pendingCmdSeen && pendingCmdPayload.length())
